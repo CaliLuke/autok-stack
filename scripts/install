@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEST_DIR="${HOME}/.local/bin"
+DEST_PATH="$DEST_DIR/stack"
+
+if ! command -v go >/dev/null 2>&1; then
+  echo "go is required but was not found in PATH" >&2
+  exit 1
+fi
+
+mkdir -p "$DEST_DIR"
+
+echo "Building stack from $ROOT_DIR"
+(
+  cd "$ROOT_DIR"
+  go build -o "$DEST_PATH" .
+)
+
+chmod +x "$DEST_PATH"
+
+echo "Installed stack to $DEST_PATH"
