@@ -67,6 +67,17 @@ type composeServiceStatus struct {
 }
 
 type tickMsg time.Time
+type spinnerTickMsg time.Time
+
+// spinnerFrames cycles through 10 dots-pattern braille glyphs.
+var spinnerFrames = []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'}
+
+func spinnerGlyph(frame int) string {
+	if frame < 0 {
+		frame = -frame
+	}
+	return string(spinnerFrames[frame%len(spinnerFrames)])
+}
 
 type palette struct {
 	bg       lipgloss.Color
@@ -82,18 +93,26 @@ type palette struct {
 
 type styles struct {
 	app            lipgloss.Style
-	hero           lipgloss.Style
+	heroHealthy    lipgloss.Style
+	heroDegraded   lipgloss.Style
 	heroTitle      lipgloss.Style
 	listHeader     lipgloss.Style
 	listSelected   lipgloss.Style
 	selectedAccent lipgloss.Style
 	kpiValue       lipgloss.Style
 	muted          lipgloss.Style
-	statusUp       lipgloss.Style
-	statusDown     lipgloss.Style
-	statusWarn     lipgloss.Style
-	statusDanger   lipgloss.Style
-	logBox         lipgloss.Style
+	// Row chips: fg-colored glyph + label, no background pill.
+	chipUp     lipgloss.Style
+	chipWarn   lipgloss.Style
+	chipDown   lipgloss.Style
+	chipDanger lipgloss.Style
+	// Hero badge: solid bg pill; flashes between danger/warn when degraded.
+	badgeHealthy lipgloss.Style
+	badgeWarn    lipgloss.Style
+	badgeDanger  lipgloss.Style
+	// Used for focus-line error banner and other inline-warning surfaces.
+	statusDanger lipgloss.Style
+	logBox       lipgloss.Style
 }
 
 type model struct {
@@ -110,6 +129,7 @@ type model struct {
 	width        int
 	height       int
 	styles       styles
+	spinnerFrame int
 }
 
 func main() {
@@ -712,6 +732,12 @@ func tickCmd() tea.Cmd {
 	})
 }
 
+func spinnerTickCmd() tea.Cmd {
+	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg {
+		return spinnerTickMsg(t)
+	})
+}
+
 func waitForExitCmd(ch <-chan processExitMsg) tea.Cmd {
 	return func() tea.Msg {
 		msg, ok := <-ch
@@ -723,7 +749,23 @@ func waitForExitCmd(ch <-chan processExitMsg) tea.Cmd {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(tickCmd(), waitForExitCmd(m.exitCh))
+	return tea.Batch(tickCmd(), spinnerTickCmd(), waitForExitCmd(m.exitCh))
+}
+
+// anyAnimating reports whether something on screen wants a fast redraw —
+// either a spinner is spinning (something is restarting) or the degraded
+// badge is flashing (anyExited). Avoids burning a 100ms tick when the
+// dashboard is fully healthy and static.
+func (m model) anyAnimating() bool {
+	if m.anyExited {
+		return true
+	}
+	for _, s := range m.services {
+		if s != nil && s.restarting {
+			return true
+		}
+	}
+	return false
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -764,6 +806,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+	case spinnerTickMsg:
+		m.spinnerFrame++
+		if m.anyAnimating() {
+			return m, spinnerTickCmd()
+		}
+		// Schedule one more tick so we resume animation as soon as state changes.
+		return m, tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg {
+			return spinnerTickMsg(t)
+		})
 	case tickMsg:
 		now := time.Now()
 		for _, state := range m.services {
@@ -861,15 +912,18 @@ func (m model) renderCompactFallback() string {
 		state := m.services[key]
 		cursor := " "
 		if i == m.selected {
-			cursor = ">"
+			cursor = "▌"
 		}
-		status := "DOWN"
-		if state.running {
-			status = "UP"
-		} else if state.restarting {
-			status = "RESTART"
+		status := "◯ down"
+		switch {
+		case state.restarting:
+			status = spinnerGlyph(m.spinnerFrame) + " restart"
+		case state.running:
+			status = "● live"
+		case state.exitErr != nil:
+			status = "✕ exit"
 		}
-		b.WriteString(fmt.Sprintf("%s %-10s %-4s pid=%d ports=%s\n", cursor, state.config.Name, status, state.pid, strings.Join(state.config.Ports, ",")))
+		b.WriteString(fmt.Sprintf("%s %-10s %-10s pid=%d ports=%s\n", cursor, state.config.Name, status, state.pid, strings.Join(state.config.Ports, ",")))
 	}
 	b.WriteString("\n")
 	b.WriteString(fmt.Sprintf("selected: %s\n", selected.config.LogFile))
@@ -889,11 +943,18 @@ func (m model) renderHero(width int) string {
 		}
 	}
 
-	tone := m.styles.statusUp
-	if m.anyExited {
-		tone = m.styles.statusDanger
+	// Healthy: solid green pill. Degraded: alternate danger/warn each 500ms
+	// (5 spinner frames) so the eye is drawn to the count without it being
+	// a frenetic flash.
+	badgeText := fmt.Sprintf(" %d/%d live ", upCount, len(m.order))
+	var badge string
+	if !m.anyExited {
+		badge = m.styles.badgeHealthy.Render(badgeText)
+	} else if (m.spinnerFrame/5)%2 == 0 {
+		badge = m.styles.badgeDanger.Render(badgeText)
+	} else {
+		badge = m.styles.badgeWarn.Render(badgeText)
 	}
-	badge := tone.Render(fmt.Sprintf(" %d/%d live ", upCount, len(m.order)))
 
 	title := m.styles.heroTitle.Render(m.title)
 
@@ -909,9 +970,9 @@ func (m model) renderHero(width int) string {
 	leftW := lipgloss.Width(left)
 	middleW := lipgloss.Width(middle)
 	metaW := lipgloss.Width(meta)
-	// 4 = hero internal horizontal padding (2 each side).
+	// 6 = 2 (border) + 4 (horizontal padding inside the border, 2 each side).
 	// Distribute remaining space: half before middle, half after.
-	remaining := width - leftW - middleW - metaW - 4
+	remaining := width - leftW - middleW - metaW - 6
 	if remaining < 2 {
 		remaining = 2
 	}
@@ -924,7 +985,12 @@ func (m model) renderHero(width int) string {
 		rightGap = 1
 	}
 	content := left + strings.Repeat(" ", leftGap) + middle + strings.Repeat(" ", rightGap) + meta
-	return m.styles.hero.Width(width).Render(content)
+
+	heroStyle := m.styles.heroHealthy
+	if m.anyExited {
+		heroStyle = m.styles.heroDegraded
+	}
+	return heroStyle.Width(width).Render(content)
 }
 
 // columnWidths derives shared column widths for the service list so the header
@@ -945,8 +1011,8 @@ func (m model) columnWidths(width int) (nameW, portsW, pidW, ageW, statusW int) 
 		}
 	}
 	pidW = 7
-	ageW = 7
-	statusW = 8
+	ageW = 8 // fits "1m 35s" / "2d 4h" with the new space separator
+	statusW = 9 // fits the longest chip: "⠋ restart"
 	// Guard against absurd port lists eating the entire row.
 	maxPorts := max(8, width-nameW-pidW-ageW-statusW-12)
 	if portsW > maxPorts {
@@ -995,30 +1061,32 @@ func (m model) renderServiceList(width int) string {
 }
 
 func (m model) statusChip(state *serviceState, width int) string {
+	glyph := "◯"
 	label := "down"
-	style := m.styles.statusDown
+	style := m.styles.chipDown
 	switch {
 	case state.restarting:
+		glyph = spinnerGlyph(m.spinnerFrame)
 		label = "restart"
-		style = m.styles.statusWarn
+		style = m.styles.chipWarn
 	case state.running:
+		glyph = "●"
 		label = "live"
-		style = m.styles.statusUp
+		style = m.styles.chipUp
 	case state.exitErr != nil:
+		glyph = "✕"
 		label = "exit"
-		style = m.styles.statusDanger
+		style = m.styles.chipDanger
 	case state.composeDown:
+		glyph = "◯"
 		label = "down"
-		style = m.styles.statusDanger
+		style = m.styles.chipDanger
 	}
-	if width < len(label)+2 {
-		width = len(label) + 2
+	rendered := style.Render(glyph + " " + label)
+	if pad := width - lipgloss.Width(rendered); pad > 0 {
+		rendered += strings.Repeat(" ", pad)
 	}
-	pad := width - len(label) - 2 // 2 for the spaces in the chip
-	if pad < 0 {
-		pad = 0
-	}
-	return style.Render(" "+label+" ") + strings.Repeat(" ", pad)
+	return rendered
 }
 
 // renderFocusLine renders a single line summarizing the selected service's command
@@ -1211,12 +1279,12 @@ func (m model) uptimeText(state *serviceState) string {
 	return "-"
 }
 
-// formatDuration renders a duration compactly:
+// formatDuration renders a duration compactly with a space between units:
 //
 //	<1m         → "12s"
-//	<1h         → "3m" or "3m12s" (skip seconds once > 5 minutes)
-//	<24h        → "1h" or "1h47m" (skip minutes once > 6 hours)
-//	otherwise   → "2d" or "2d4h"
+//	<1h         → "3m" or "3m 12s" (skip seconds once > 5 minutes)
+//	<24h        → "1h" or "1h 47m" (skip minutes once > 6 hours)
+//	otherwise   → "2d" or "2d 4h"
 func formatDuration(d time.Duration) string {
 	if d < 0 {
 		d = 0
@@ -1230,7 +1298,7 @@ func formatDuration(d time.Duration) string {
 		if m >= 5 || s == 0 {
 			return fmt.Sprintf("%dm", m)
 		}
-		return fmt.Sprintf("%dm%ds", m, s)
+		return fmt.Sprintf("%dm %ds", m, s)
 	}
 	if d < 24*time.Hour {
 		h := int(d.Hours())
@@ -1238,14 +1306,14 @@ func formatDuration(d time.Duration) string {
 		if h >= 6 || mins == 0 {
 			return fmt.Sprintf("%dh", h)
 		}
-		return fmt.Sprintf("%dh%dm", h, mins)
+		return fmt.Sprintf("%dh %dm", h, mins)
 	}
 	days := int(d.Hours()) / 24
 	hours := int(d.Hours()) - days*24
 	if hours == 0 {
 		return fmt.Sprintf("%dd", days)
 	}
-	return fmt.Sprintf("%dd%dh", days, hours)
+	return fmt.Sprintf("%dd %dh", days, hours)
 }
 
 func pidLabel(pid int) string {
@@ -1334,16 +1402,20 @@ func newStyles() styles {
 
 	selectedBg := lipgloss.Color("#1B2638")
 
+	heroBase := lipgloss.NewStyle().
+		Background(p.panelAlt).
+		Foreground(p.text).
+		Border(lipgloss.RoundedBorder()).
+		Padding(0, 2).
+		MarginBottom(1)
+
 	return styles{
 		app: lipgloss.NewStyle().
 			Background(p.bg).
 			Foreground(p.text).
 			Padding(0, 1),
-		hero: lipgloss.NewStyle().
-			Background(p.panelAlt).
-			Foreground(p.text).
-			Padding(0, 2).
-			MarginBottom(1),
+		heroHealthy:  heroBase.BorderForeground(p.accent),
+		heroDegraded: heroBase.BorderForeground(p.danger),
 		heroTitle: lipgloss.NewStyle().
 			Foreground(p.accent).
 			Bold(true),
@@ -1363,19 +1435,30 @@ func newStyles() styles {
 			Bold(true),
 		muted: lipgloss.NewStyle().
 			Foreground(p.muted),
-		statusUp: lipgloss.NewStyle().
+		chipUp: lipgloss.NewStyle().
+			Foreground(p.success).
+			Bold(true),
+		chipWarn: lipgloss.NewStyle().
+			Foreground(p.warn).
+			Bold(true),
+		chipDown: lipgloss.NewStyle().
+			Foreground(p.muted),
+		chipDanger: lipgloss.NewStyle().
+			Foreground(p.danger).
+			Bold(true),
+		badgeHealthy: lipgloss.NewStyle().
 			Foreground(p.bg).
 			Background(p.success).
 			Bold(true).
 			Padding(0, 1),
-		statusDown: lipgloss.NewStyle().
-			Foreground(p.text).
-			Background(p.border).
-			Bold(true).
-			Padding(0, 1),
-		statusWarn: lipgloss.NewStyle().
+		badgeWarn: lipgloss.NewStyle().
 			Foreground(p.bg).
 			Background(p.warn).
+			Bold(true).
+			Padding(0, 1),
+		badgeDanger: lipgloss.NewStyle().
+			Foreground(p.text).
+			Background(p.danger).
 			Bold(true).
 			Padding(0, 1),
 		statusDanger: lipgloss.NewStyle().

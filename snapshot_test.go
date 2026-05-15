@@ -40,6 +40,23 @@ func TestUISnapshot(t *testing.T) {
 			m.services["admin"].composeDown = true
 			m.anyExited = true
 		}},
+		{name: "wide-spinner-frame-5", width: 140, height: 40, mutate: func(m *model) {
+			m.services["frontend"].restarting = true
+			m.services["server"].restarting = true
+			m.spinnerFrame = 5
+		}},
+		{name: "wide-degraded-flash-on", width: 140, height: 40, mutate: func(m *model) {
+			m.services["server"].running = false
+			m.services["server"].exitErr = fmt.Errorf("uvicorn exited with code 1")
+			m.anyExited = true
+			m.spinnerFrame = 0 // flash "on" half of the cycle
+		}},
+		{name: "wide-degraded-flash-off", width: 140, height: 40, mutate: func(m *model) {
+			m.services["server"].running = false
+			m.services["server"].exitErr = fmt.Errorf("uvicorn exited with code 1")
+			m.anyExited = true
+			m.spinnerFrame = 5 // flash "off" half of the cycle
+		}},
 		{name: "wide-selected-server", width: 140, height: 40, mutate: func(m *model) {
 			m.selected = 3 // server
 		}},
