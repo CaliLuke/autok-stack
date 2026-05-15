@@ -70,39 +70,30 @@ type tickMsg time.Time
 
 type palette struct {
 	bg       lipgloss.Color
-	panel    lipgloss.Color
 	panelAlt lipgloss.Color
 	border   lipgloss.Color
 	muted    lipgloss.Color
 	text     lipgloss.Color
 	accent   lipgloss.Color
-	accent2  lipgloss.Color
 	success  lipgloss.Color
 	warn     lipgloss.Color
 	danger   lipgloss.Color
 }
 
 type styles struct {
-	app          lipgloss.Style
-	hero         lipgloss.Style
-	heroTitle    lipgloss.Style
-	heroMeta     lipgloss.Style
-	panel        lipgloss.Style
-	panelAlt     lipgloss.Style
-	panelTitle   lipgloss.Style
-	listItem     lipgloss.Style
-	listSelected lipgloss.Style
-	listMuted    lipgloss.Style
-	kpi          lipgloss.Style
-	kpiValue     lipgloss.Style
-	body         lipgloss.Style
-	muted        lipgloss.Style
-	statusUp     lipgloss.Style
-	statusDown   lipgloss.Style
-	statusWarn   lipgloss.Style
-	logBox       lipgloss.Style
-	footer       lipgloss.Style
-	code         lipgloss.Style
+	app            lipgloss.Style
+	hero           lipgloss.Style
+	heroTitle      lipgloss.Style
+	listHeader     lipgloss.Style
+	listSelected   lipgloss.Style
+	selectedAccent lipgloss.Style
+	kpiValue       lipgloss.Style
+	muted          lipgloss.Style
+	statusUp       lipgloss.Style
+	statusDown     lipgloss.Style
+	statusWarn     lipgloss.Style
+	statusDanger   lipgloss.Style
+	logBox         lipgloss.Style
 }
 
 type model struct {
@@ -555,7 +546,7 @@ func (cfg serviceConfig) composeBaseArgs() []string {
 
 func (cfg serviceConfig) commandText() string {
 	if cfg.isComposeService() {
-		return "podman " + strings.Join(append(cfg.composeBaseArgs(), append([]string{"up", "-d"}, cfg.ComposeServices...)...), " ")
+		return "compose: " + strings.Join(cfg.ComposeServices, " ")
 	}
 	return strings.Join(cfg.Command, " ")
 }
@@ -900,15 +891,40 @@ func (m model) renderHero(width int) string {
 
 	tone := m.styles.statusUp
 	if m.anyExited {
-		tone = m.styles.statusWarn
+		tone = m.styles.statusDanger
 	}
 	badge := tone.Render(fmt.Sprintf(" %d/%d live ", upCount, len(m.order)))
 
 	title := m.styles.heroTitle.Render(m.title)
+
+	// Middle: show the currently selected service so the eye has a target.
+	var middle string
+	if sel := m.selectedState(); sel != nil && sel.config.Name != "" {
+		middle = m.styles.muted.Render("focus ") + m.styles.kpiValue.Render(sel.config.Name)
+	}
+
 	meta := m.styles.muted.Render(fmt.Sprintf("log cap %s", humanBytes(m.maxLogBytes)))
 
-	left := lipgloss.JoinHorizontal(lipgloss.Center, title, "  ", badge, "  ", meta)
-	return lipgloss.NewStyle().Width(width).Render(left)
+	left := lipgloss.JoinHorizontal(lipgloss.Center, title, "  ", badge)
+	leftW := lipgloss.Width(left)
+	middleW := lipgloss.Width(middle)
+	metaW := lipgloss.Width(meta)
+	// 4 = hero internal horizontal padding (2 each side).
+	// Distribute remaining space: half before middle, half after.
+	remaining := width - leftW - middleW - metaW - 4
+	if remaining < 2 {
+		remaining = 2
+	}
+	leftGap := remaining / 2
+	rightGap := remaining - leftGap
+	if leftGap < 1 {
+		leftGap = 1
+	}
+	if rightGap < 1 {
+		rightGap = 1
+	}
+	content := left + strings.Repeat(" ", leftGap) + middle + strings.Repeat(" ", rightGap) + meta
+	return m.styles.hero.Width(width).Render(content)
 }
 
 // columnWidths derives shared column widths for the service list so the header
@@ -943,7 +959,7 @@ func (m model) renderServiceList(width int) string {
 	nameW, portsW, pidW, ageW, statusW := m.columnWidths(width)
 
 	headerFmt := fmt.Sprintf("  %%-%ds  %%-%ds  %%-%ds  %%-%ds  %%-%ds", nameW, portsW, pidW, ageW, statusW)
-	header := m.styles.muted.Render(fmt.Sprintf(headerFmt, "service", "ports", "pid", "uptime", "status"))
+	header := m.styles.listHeader.Render(fmt.Sprintf(headerFmt, "service", "ports", "pid", "uptime", "status"))
 
 	rows := make([]string, 0, len(m.order)+1)
 	rows = append(rows, header)
@@ -953,11 +969,11 @@ func (m model) renderServiceList(width int) string {
 			continue
 		}
 
-		cursor := " "
+		cursor := "  "
 		if i == m.selected {
-			cursor = m.styles.kpiValue.Render("›")
+			cursor = m.styles.selectedAccent.Render("▌ ")
 		}
-		rowFmt := fmt.Sprintf("%%s %%-%ds  %%-%ds  %%-%ds  %%-%ds  ", nameW, portsW, pidW, ageW)
+		rowFmt := fmt.Sprintf("%%s%%-%ds  %%-%ds  %%-%ds  %%-%ds  ", nameW, portsW, pidW, ageW)
 		body := fmt.Sprintf(
 			rowFmt,
 			cursor,
@@ -990,10 +1006,10 @@ func (m model) statusChip(state *serviceState, width int) string {
 		style = m.styles.statusUp
 	case state.exitErr != nil:
 		label = "exit"
-		style = m.styles.statusWarn
+		style = m.styles.statusDanger
 	case state.composeDown:
 		label = "down"
-		style = m.styles.statusWarn
+		style = m.styles.statusDanger
 	}
 	if width < len(label)+2 {
 		width = len(label) + 2
@@ -1006,8 +1022,8 @@ func (m model) statusChip(state *serviceState, width int) string {
 }
 
 // renderFocusLine renders a single line summarizing the selected service's command
-// and log file, plus its last-exit message if it has one. Replaces the old
-// multi-line "Service Focus" panel.
+// and log file, plus its last-exit message if it has one. Indented to match the
+// service list (3-column gutter), and prefixed with a subtle separator above it.
 func (m model) renderFocusLine(state *serviceState, width int) string {
 	if state == nil {
 		return ""
@@ -1018,11 +1034,18 @@ func (m model) renderFocusLine(state *serviceState, width int) string {
 		logRel = rel
 	}
 
-	primary := m.styles.muted.Render("cmd ") + truncateText(cmd, max(20, width-12-len(logRel)))
-	secondary := m.styles.muted.Render("  log ") + truncateText(logRel, max(12, width/3))
-	line := primary + secondary
+	cmdLabel := m.styles.muted.Render("cmd")
+	logLabel := m.styles.muted.Render("log")
+	sep := m.styles.muted.Render("  ·  ")
+
+	// Reserve space for "  cmd " + " " + "  · " + " log " + log + a small margin.
+	cmdMax := max(20, width-len(logRel)-18)
+	cmdText := truncateText(cmd, cmdMax)
+	line := "  " + cmdLabel + " " + cmdText + sep + logLabel + " " + logRel
+
 	if state.exitErr != nil {
-		line = m.styles.statusWarn.Render(" "+truncateText(state.exitErr.Error(), max(20, width-4))+" ") + " " + line
+		errMsg := truncateText(state.exitErr.Error(), max(20, width-6))
+		line = "  " + m.styles.statusDanger.Render(" "+errMsg+" ")
 	}
 	return lipgloss.NewStyle().Width(width).Render(line)
 }
@@ -1180,12 +1203,49 @@ func (m model) uptimeText(state *serviceState) string {
 		return "-"
 	}
 	if state.running {
-		return time.Since(state.startedAt).Round(time.Second).String()
+		return formatDuration(time.Since(state.startedAt))
 	}
 	if !state.stoppedAt.IsZero() && !state.startedAt.IsZero() {
-		return state.stoppedAt.Sub(state.startedAt).Round(time.Second).String()
+		return formatDuration(state.stoppedAt.Sub(state.startedAt))
 	}
 	return "-"
+}
+
+// formatDuration renders a duration compactly:
+//
+//	<1m         → "12s"
+//	<1h         → "3m" or "3m12s" (skip seconds once > 5 minutes)
+//	<24h        → "1h" or "1h47m" (skip minutes once > 6 hours)
+//	otherwise   → "2d" or "2d4h"
+func formatDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		m := int(d.Minutes())
+		s := int(d.Seconds()) - m*60
+		if m >= 5 || s == 0 {
+			return fmt.Sprintf("%dm", m)
+		}
+		return fmt.Sprintf("%dm%ds", m, s)
+	}
+	if d < 24*time.Hour {
+		h := int(d.Hours())
+		mins := int(d.Minutes()) - h*60
+		if h >= 6 || mins == 0 {
+			return fmt.Sprintf("%dh", h)
+		}
+		return fmt.Sprintf("%dh%dm", h, mins)
+	}
+	days := int(d.Hours()) / 24
+	hours := int(d.Hours()) - days*24
+	if hours == 0 {
+		return fmt.Sprintf("%dd", days)
+	}
+	return fmt.Sprintf("%dd%dh", days, hours)
 }
 
 func pidLabel(pid int) string {
@@ -1262,17 +1322,17 @@ func humanBytes(size int64) string {
 func newStyles() styles {
 	p := palette{
 		bg:       lipgloss.Color("#0C0F14"),
-		panel:    lipgloss.Color("#131923"),
 		panelAlt: lipgloss.Color("#10161F"),
 		border:   lipgloss.Color("#2D3A4F"),
 		muted:    lipgloss.Color("#8A95A5"),
 		text:     lipgloss.Color("#E7EDF7"),
 		accent:   lipgloss.Color("#79E0B3"),
-		accent2:  lipgloss.Color("#7BC6FF"),
 		success:  lipgloss.Color("#83E377"),
 		warn:     lipgloss.Color("#FFB86C"),
 		danger:   lipgloss.Color("#FF7A90"),
 	}
+
+	selectedBg := lipgloss.Color("#1B2638")
 
 	return styles{
 		app: lipgloss.NewStyle().
@@ -1281,54 +1341,26 @@ func newStyles() styles {
 			Padding(0, 1),
 		hero: lipgloss.NewStyle().
 			Background(p.panelAlt).
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(p.accent2).
-			Padding(1, 2).
+			Foreground(p.text).
+			Padding(0, 2).
 			MarginBottom(1),
 		heroTitle: lipgloss.NewStyle().
+			Foreground(p.accent).
+			Bold(true),
+		listHeader: lipgloss.NewStyle().
+			Foreground(p.muted).
+			Background(p.panelAlt),
+		listSelected: lipgloss.NewStyle().
+			Background(selectedBg).
 			Foreground(p.text).
 			Bold(true),
-		heroMeta: lipgloss.NewStyle().
-			Foreground(p.muted).
-			MarginTop(1),
-		panel: lipgloss.NewStyle().
-			Background(p.panel).
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(p.border).
-			Padding(1, 1).
-			MarginRight(1).
-			MarginBottom(1),
-		panelAlt: lipgloss.NewStyle().
-			Background(p.panelAlt).
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(p.border).
-			Padding(1, 1).
-			MarginBottom(1),
-		panelTitle: lipgloss.NewStyle().
-			Foreground(p.accent2).
+		selectedAccent: lipgloss.NewStyle().
+			Foreground(p.accent).
+			Background(selectedBg).
 			Bold(true),
-		listItem: lipgloss.NewStyle().
-			Background(p.panelAlt).
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(p.border).
-			Padding(0, 1).
-			MarginTop(1),
-		listSelected: lipgloss.NewStyle().
-			Background(lipgloss.Color("#172333")).
-			Border(lipgloss.ThickBorder()).
-			BorderForeground(p.accent).
-			Padding(0, 1).
-			MarginTop(1),
-		listMuted: lipgloss.NewStyle().
-			Foreground(p.muted),
-		kpi: lipgloss.NewStyle().
-			Foreground(p.muted),
 		kpiValue: lipgloss.NewStyle().
 			Foreground(p.text).
 			Bold(true),
-		body: lipgloss.NewStyle().
-			Foreground(p.text).
-			PaddingRight(2),
 		muted: lipgloss.NewStyle().
 			Foreground(p.muted),
 		statusUp: lipgloss.NewStyle().
@@ -1346,16 +1378,17 @@ func newStyles() styles {
 			Background(p.warn).
 			Bold(true).
 			Padding(0, 1),
+		statusDanger: lipgloss.NewStyle().
+			Foreground(p.text).
+			Background(p.danger).
+			Bold(true).
+			Padding(0, 1),
 		logBox: lipgloss.NewStyle().
 			Foreground(p.text).
 			Background(lipgloss.Color("#0A0E14")).
-			Border(lipgloss.NormalBorder()).
+			Border(lipgloss.RoundedBorder()).
 			BorderForeground(p.border).
 			Padding(0, 1),
-		footer: lipgloss.NewStyle().
-			Foreground(p.muted),
-		code: lipgloss.NewStyle().
-			Foreground(p.text),
 	}
 }
 
