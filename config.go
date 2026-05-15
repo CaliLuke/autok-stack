@@ -156,9 +156,11 @@ func buildServiceConfig(rootDir, logDir string, s serviceBlock) (serviceConfig, 
 	command := make([]string, len(s.Command))
 	for i, part := range s.Command {
 		// Only resolve the first token if it looks like a relative path (starts with ./ or ../).
+		// Resolve against the service's work_dir, not the stack root — the user's
+		// `command = ["./dev.sh"]` is implicitly relative to where the service runs.
 		// Bare commands like "bun" stay bare for PATH lookup.
 		if i == 0 && looksLikeRelativePath(part) {
-			command[i] = resolvePath(rootDir, part)
+			command[i] = resolvePath(workDir, part)
 		} else {
 			command[i] = part
 		}
