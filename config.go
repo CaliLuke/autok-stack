@@ -15,14 +15,15 @@ const configFileName = "stack.toml"
 // fileConfig mirrors the TOML layout. Paths are relative to the directory
 // containing stack.toml unless they're already absolute.
 type fileConfig struct {
-	Stack    stackBlock      `toml:"stack"`
-	Services []serviceBlock  `toml:"service"`
+	Stack    stackBlock     `toml:"stack"`
+	Services []serviceBlock `toml:"service"`
 }
 
 type stackBlock struct {
 	Title           string   `toml:"title"`
 	LogDir          string   `toml:"log_dir"`
 	RequiredTools   []string `toml:"required_tools"`
+	ComposeCommand  []string `toml:"compose_command"`
 	CleanupPatterns []string `toml:"cleanup_patterns"`
 }
 
@@ -44,6 +45,7 @@ type loadedConfig struct {
 	title           string
 	logDir          string
 	requiredTools   []string
+	composeCommand  []string
 	cleanupPatterns []string
 	services        []serviceConfig
 }
@@ -100,6 +102,11 @@ func loadConfig(start string) (*loadedConfig, error) {
 		cleanupPatterns = append(cleanupPatterns, resolvePath(rootDir, p))
 	}
 
+	composeCommand := raw.Stack.ComposeCommand
+	if len(composeCommand) == 0 {
+		composeCommand = []string{"podman", "compose"}
+	}
+
 	services := make([]serviceConfig, 0, len(raw.Services))
 	seenKeys := make(map[string]struct{}, len(raw.Services))
 	for i, s := range raw.Services {
@@ -119,6 +126,7 @@ func loadConfig(start string) (*loadedConfig, error) {
 		title:           title,
 		logDir:          logDir,
 		requiredTools:   raw.Stack.RequiredTools,
+		composeCommand:  composeCommand,
 		cleanupPatterns: cleanupPatterns,
 		services:        services,
 	}, nil

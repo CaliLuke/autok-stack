@@ -30,6 +30,7 @@ All non-absolute paths are resolved relative to the directory containing `stack.
 title = "MY STACK"                          # shown in the TUI hero, default "STACK"
 log_dir = ".tmp/dev-stack"                  # default ".tmp/dev-stack"
 required_tools = ["go", "bun", "podman"]    # checked on startup; missing tool = fatal
+compose_command = ["podman", "compose"]     # optional, defaults to podman compose
 cleanup_patterns = [                        # `pkill -f` patterns run before services start
   "scripts/log-server.ts",
 ]
@@ -56,7 +57,15 @@ compose_file = "backend/docker-compose.yml"
 compose_services = ["postgres", "pgbouncer"]
 ```
 
-A service is either a `command` (plain process) or a `compose_services` list (managed via `podman compose`). Compose services aren't torn down when you quit the dashboard.
+A service is either a `command` (plain process) or a `compose_services` list (managed via `compose_command`). Compose services aren't torn down when you quit the dashboard.
+
+`compose_command` defaults to `["podman", "compose"]`. For Docker-backed runtimes such as Colima, set:
+
+```toml
+[stack]
+required_tools = ["go", "bun", "docker"]
+compose_command = ["docker", "compose"]
+```
 
 ## Keys
 

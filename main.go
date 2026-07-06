@@ -29,6 +29,7 @@ type serviceConfig struct {
 	Command         []string
 	ComposeFile     string
 	ComposeServices []string
+	ComposeCommand  []string
 	// AutoRestart enables exponential-backoff restart of crashed processes.
 	AutoRestart bool
 	// ReadinessTimeout bounds how long startup waits for the service to bind its first port.
@@ -182,6 +183,7 @@ func main() {
 	order := make([]string, 0, len(cfg.services))
 
 	for _, sc := range cfg.services {
+		sc.ComposeCommand = cfg.composeCommand
 		state, err := startService(sc, exitCh)
 		if err != nil {
 			_ = shutdownServices(services, order)
@@ -561,7 +563,17 @@ func (cfg serviceConfig) isComposeService() bool {
 }
 
 func (cfg serviceConfig) composeBaseArgs() []string {
-	return []string{"compose", "-f", filepath.Base(cfg.ComposeFile)}
+	return []string{"-f", filepath.Base(cfg.ComposeFile)}
+}
+
+func (cfg serviceConfig) composeCommand(args ...string) *exec.Cmd {
+	command := cfg.ComposeCommand
+	if len(command) == 0 {
+		command = []string{"podman", "compose"}
+	}
+	cmd := exec.Command(command[0], append(command[1:], args...)...)
+	cmd.Dir = cfg.WorkDir
+	return cmd
 }
 
 func (cfg serviceConfig) commandText() string {
@@ -581,8 +593,7 @@ func ensureComposeServicesUp(cfg serviceConfig) error {
 	}
 
 	args := append(cfg.composeBaseArgs(), append([]string{"up", "-d"}, cfg.ComposeServices...)...)
-	cmd := exec.Command("podman", args...)
-	cmd.Dir = cfg.WorkDir
+	cmd := cfg.composeCommand(args...)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("start compose services: %w%s", err, formatCommandOutput(output))
 	}
@@ -599,8 +610,7 @@ func ensureComposeServicesUp(cfg serviceConfig) error {
 
 func restartComposeServices(cfg serviceConfig) error {
 	args := append(cfg.composeBaseArgs(), append([]string{"restart"}, cfg.ComposeServices...)...)
-	cmd := exec.Command("podman", args...)
-	cmd.Dir = cfg.WorkDir
+	cmd := cfg.composeCommand(args...)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("restart compose services: %w%s", err, formatCommandOutput(output))
 	}
@@ -609,8 +619,7 @@ func restartComposeServices(cfg serviceConfig) error {
 
 func readComposeStatuses(cfg serviceConfig) ([]composeServiceStatus, error) {
 	args := append(cfg.composeBaseArgs(), append([]string{"ps", "--format", "json"}, cfg.ComposeServices...)...)
-	cmd := exec.Command("podman", args...)
-	cmd.Dir = cfg.WorkDir
+	cmd := cfg.composeCommand(args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	output, err := cmd.Output()
@@ -1011,7 +1020,7 @@ func (m model) columnWidths(width int) (nameW, portsW, pidW, ageW, statusW int) 
 		}
 	}
 	pidW = 7
-	ageW = 8 // fits "1m 35s" / "2d 4h" with the new space separator
+	ageW = 8    // fits "1m 35s" / "2d 4h" with the new space separator
 	statusW = 9 // fits the longest chip: "⠋ restart"
 	// Guard against absurd port lists eating the entire row.
 	maxPorts := max(8, width-nameW-pidW-ageW-statusW-12)
