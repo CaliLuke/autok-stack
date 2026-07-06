@@ -21,6 +21,14 @@ cd ~/code/myproject/some/subdir
 stack
 ```
 
+To make `stack` launch one default repo even when your shell is elsewhere, set:
+
+```bash
+export STACK_DEFAULT_DIR="$HOME/code/myproject"
+```
+
+The nearest `stack.toml` still wins when you are inside another stack-managed repo.
+
 ## Config — `stack.toml`
 
 All non-absolute paths are resolved relative to the directory containing `stack.toml`. `log_file` is always relative to `log_dir`.

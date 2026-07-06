@@ -11,6 +11,7 @@ import (
 )
 
 const configFileName = "stack.toml"
+const defaultDirEnv = "STACK_DEFAULT_DIR"
 
 // fileConfig mirrors the TOML layout. Paths are relative to the directory
 // containing stack.toml unless they're already absolute.
@@ -53,6 +54,19 @@ type loadedConfig struct {
 // findConfigFile walks up from start until it finds a stack.toml or hits the
 // filesystem root. Returns the absolute path of the file.
 func findConfigFile(start string) (string, error) {
+	if path, err := findConfigFileUpward(start); err == nil {
+		return path, nil
+	}
+	if fallback := os.Getenv(defaultDirEnv); fallback != "" {
+		if path, err := findConfigFileUpward(fallback); err == nil {
+			return path, nil
+		}
+		return "", fmt.Errorf("no %s found in %s or any parent directory, and %s=%s did not contain one", configFileName, start, defaultDirEnv, fallback)
+	}
+	return "", fmt.Errorf("no %s found in %s or any parent directory", configFileName, start)
+}
+
+func findConfigFileUpward(start string) (string, error) {
 	dir, err := filepath.Abs(start)
 	if err != nil {
 		return "", err
