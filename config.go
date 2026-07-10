@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -39,6 +40,8 @@ type serviceBlock struct {
 	ComposeServices  []string `toml:"compose_services"`
 	AutoRestart      bool     `toml:"auto_restart"`
 	ReadinessTimeout string   `toml:"readiness_timeout"`
+	ReadyURL         string   `toml:"ready_url"`
+	LiveURL          string   `toml:"live_url"`
 }
 
 type loadedConfig struct {
@@ -201,6 +204,12 @@ func buildServiceConfig(rootDir, logDir string, s serviceBlock) (serviceConfig, 
 		}
 		readiness = d
 	}
+	if err := validateHealthURL("ready_url", s.ReadyURL); err != nil {
+		return serviceConfig{}, fmt.Errorf("%s: %w", s.Key, err)
+	}
+	if err := validateHealthURL("live_url", s.LiveURL); err != nil {
+		return serviceConfig{}, fmt.Errorf("%s: %w", s.Key, err)
+	}
 
 	return serviceConfig{
 		Key:              s.Key,
@@ -213,7 +222,20 @@ func buildServiceConfig(rootDir, logDir string, s serviceBlock) (serviceConfig, 
 		ComposeServices:  s.ComposeServices,
 		AutoRestart:      s.AutoRestart,
 		ReadinessTimeout: readiness,
+		ReadyURL:         s.ReadyURL,
+		LiveURL:          s.LiveURL,
 	}, nil
+}
+
+func validateHealthURL(field, rawURL string) error {
+	if rawURL == "" {
+		return nil
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return fmt.Errorf("%s must be an absolute HTTP(S) URL", field)
+	}
+	return nil
 }
 
 func resolvePath(rootDir, p string) string {

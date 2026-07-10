@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -34,6 +35,9 @@ type serviceConfig struct {
 	AutoRestart bool
 	// ReadinessTimeout bounds how long startup waits for the service to bind its first port.
 	ReadinessTimeout time.Duration
+	// ReadyURL is authoritative when configured; a listening port alone is not readiness.
+	ReadyURL string
+	LiveURL  string
 }
 
 type serviceState struct {
@@ -50,6 +54,7 @@ type serviceState struct {
 	restartAttempt int
 	nextRestartAt  time.Time
 	composeDown    bool
+	liveFailures   int
 }
 
 type processExitMsg struct {
@@ -66,6 +71,8 @@ type composeServiceStatus struct {
 	Health   string `json:"Health"`
 	ExitCode int    `json:"ExitCode"`
 }
+
+const composeRuntime = "docker"
 
 type tickMsg time.Time
 type spinnerTickMsg time.Time
@@ -186,29 +193,37 @@ func main() {
 		sc.ComposeCommand = cfg.composeCommand
 		state, err := startService(sc, exitCh)
 		if err != nil {
-			_ = shutdownServices(services, order)
-			fmt.Fprintf(os.Stderr, "failed to start %s: %v\n", sc.Name, err)
+			shutdownErr := shutdownServices(services, order)
+			fmt.Fprintf(os.Stderr, "failed to start %s: %v\n", sc.Name, errors.Join(err, shutdownErr))
 			os.Exit(1)
 		}
 		services[sc.Key] = state
 		order = append(order, sc.Key)
 		if err := capLogFile(sc.LogFile, maxLogBytes); err != nil {
-			_ = shutdownServices(services, order)
-			fmt.Fprintf(os.Stderr, "failed to trim log %s: %v\n", sc.LogFile, err)
+			shutdownErr := shutdownServices(services, order)
+			fmt.Fprintf(os.Stderr, "failed to trim log %s: %v\n", sc.LogFile, errors.Join(err, shutdownErr))
 			os.Exit(1)
 		}
 		if sc.isComposeService() {
 			if err := refreshComposeService(state); err != nil {
-				_ = shutdownServices(services, order)
-				fmt.Fprintf(os.Stderr, "failed to refresh %s: %v\n", sc.Name, err)
+				shutdownErr := shutdownServices(services, order)
+				fmt.Fprintf(os.Stderr, "failed to refresh %s: %v\n", sc.Name, errors.Join(err, shutdownErr))
 				os.Exit(1)
+			}
+			if sc.ReadyURL != "" {
+				if err := waitForReadiness(sc); err != nil {
+					shutdownErr := shutdownServices(services, order)
+					fmt.Fprintf(os.Stderr, "failed readiness for %s: %v\n", sc.Name, errors.Join(err, shutdownErr))
+					os.Exit(1)
+				}
 			}
 		} else {
 			state.lastLogTail = readLogTail(sc.LogFile, 18)
 			if err := waitForReadiness(sc); err != nil {
-				// Readiness failure is informational — the service may still come up.
-				// Surface it in the log tail so the dashboard reflects reality.
-				state.lastLogTail = strings.TrimSpace(state.lastLogTail+"\n[stack] readiness: "+err.Error()) + "\n"
+				shutdownErr := shutdownServices(services, order)
+				fmt.Fprintf(os.Stderr, "failed readiness for %s: %v\n", sc.Name, errors.Join(err, shutdownErr))
+				releaseLock()
+				os.Exit(1)
 			}
 		}
 	}
@@ -331,7 +346,7 @@ func isLiveStackProcess(pid int) bool {
 func parseMaxLogBytes() (int64, error) {
 	raw := os.Getenv("MAX_LOG_BYTES")
 	if raw == "" {
-		return 1048576, nil
+		return 16 * 1024 * 1024, nil
 	}
 
 	value, err := strconv.ParseInt(raw, 10, 64)
@@ -346,7 +361,7 @@ func parseMaxLogBytes() (int64, error) {
 
 func truncateLogs(configs []serviceConfig) error {
 	for _, cfg := range configs {
-		if err := os.WriteFile(cfg.LogFile, nil, 0o644); err != nil {
+		if err := os.WriteFile(cfg.LogFile, nil, 0o600); err != nil {
 			return err
 		}
 	}
@@ -372,7 +387,7 @@ func startService(cfg serviceConfig, exitCh chan<- processExitMsg) (*serviceStat
 		return nil, err
 	}
 
-	logFile, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	logFile, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -455,7 +470,7 @@ func stopProcessGroup(pid int) error {
 		return err
 	}
 
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		err := syscall.Kill(-pid, 0)
 		if errors.Is(err, syscall.ESRCH) {
@@ -467,14 +482,21 @@ func stopProcessGroup(pid int) error {
 	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return err
 	}
-	return nil
+	killDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(killDeadline) {
+		if err := syscall.Kill(-pid, 0); errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("process group %d did not exit after SIGKILL", pid)
 }
 
 // waitForReadiness blocks until the service's first declared port accepts a TCP
 // connection, or the configured timeout elapses. Services with no ports return
 // immediately. This replaces the previous fixed 1-second inter-start sleep.
 func waitForReadiness(cfg serviceConfig) error {
-	if len(cfg.Ports) == 0 {
+	if cfg.ReadyURL == "" && len(cfg.Ports) == 0 {
 		return nil
 	}
 	timeout := cfg.ReadinessTimeout
@@ -482,6 +504,20 @@ func waitForReadiness(cfg serviceConfig) error {
 		timeout = 5 * time.Second
 	}
 	deadline := time.Now().Add(timeout)
+	if cfg.ReadyURL != "" {
+		client := &http.Client{Timeout: 500 * time.Millisecond}
+		for time.Now().Before(deadline) {
+			response, err := client.Get(cfg.ReadyURL)
+			if err == nil {
+				_ = response.Body.Close()
+				if response.StatusCode == http.StatusOK {
+					return nil
+				}
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		return fmt.Errorf("%s did not become ready within %s", cfg.ReadyURL, timeout)
+	}
 	port := cfg.Ports[0]
 	addr := net.JoinHostPort("127.0.0.1", port)
 	for time.Now().Before(deadline) {
@@ -493,6 +529,20 @@ func waitForReadiness(cfg serviceConfig) error {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return fmt.Errorf("port %s did not become ready within %s", port, timeout)
+}
+
+// checkHealthURL accepts only HTTP 200 so a bound but degraded service is not treated as live.
+func checkHealthURL(rawURL string) error {
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	response, err := client.Get(rawURL)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("%s returned %s", rawURL, response.Status)
+	}
+	return nil
 }
 
 func ensurePortsAvailable(ports []string) error {
@@ -627,7 +677,7 @@ func readComposeStatuses(cfg serviceConfig) ([]composeServiceStatus, error) {
 		return nil, fmt.Errorf("read compose status: %w%s", err, formatCommandOutput(stderr.Bytes()))
 	}
 
-	// Newer podman/docker compose emits a JSON array; older versions emit one
+	// Newer Docker Compose emits a JSON array; older versions emit one
 	// JSON object per line (NDJSON). Detect by the first non-whitespace byte.
 	trimmed := bytes.TrimSpace(output)
 	if len(trimmed) == 0 {
@@ -697,6 +747,20 @@ func refreshComposeService(state *serviceState) error {
 		state.stoppedAt = time.Now()
 	}
 	state.lastLogTail = composeStatusSummary(state.config, statuses)
+	return nil
+}
+
+func refreshComposeServiceHealth(state *serviceState) error {
+	if err := refreshComposeService(state); err != nil {
+		return err
+	}
+	if state.running && state.config.ReadyURL != "" {
+		if err := checkHealthURL(state.config.ReadyURL); err != nil {
+			state.exitErr = fmt.Errorf("readiness failed: %w", err)
+			state.lastLogTail = state.exitErr.Error()
+			return state.exitErr
+		}
+	}
 	return nil
 }
 
@@ -802,8 +866,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if err := m.restartSelectedService(); err != nil {
 				state := m.selectedState()
 				state.exitErr = err
-				state.running = false
-				state.restarting = false
 				if state.config.isComposeService() {
 					state.lastLogTail = err.Error()
 				} else {
@@ -828,8 +890,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		now := time.Now()
 		for _, state := range m.services {
 			if state.config.isComposeService() {
-				if err := refreshComposeService(state); err != nil {
-					// A real podman/CLI failure is exceptional.
+				if err := refreshComposeServiceHealth(state); err != nil {
+					// A real Docker CLI failure is exceptional.
 					m.anyExited = true
 				}
 				// A compose service merely being "not running" right now
@@ -845,6 +907,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.anyExited = true
 			}
 			state.lastLogTail = readLogTail(state.config.LogFile, 18)
+			resetRestartBackoffAfterHealthy(state, now)
+			if state.running && state.config.LiveURL != "" {
+				if err := checkHealthURL(state.config.LiveURL); err != nil {
+					state.liveFailures++
+					if state.liveFailures >= 3 {
+						state.exitErr = fmt.Errorf("liveness failed: %w", err)
+						m.anyExited = true
+						oldPID := state.pid
+						state.ignoredExits[oldPID] = struct{}{}
+						if stopErr := stopProcessGroup(oldPID); stopErr != nil {
+							delete(state.ignoredExits, oldPID)
+							state.exitErr = errors.Join(state.exitErr, stopErr)
+							state.liveFailures = 0
+							continue
+						}
+						state.running = false
+						state.stoppedAt = now
+						state.restartAttempt++
+						state.nextRestartAt = now.Add(backoffDelay(state.restartAttempt))
+					}
+				} else {
+					state.liveFailures = 0
+				}
+			}
 
 			if state.config.AutoRestart && !state.running && !state.restarting && !m.shuttingDown {
 				if !state.nextRestartAt.IsZero() && now.Before(state.nextRestartAt) {
@@ -1198,7 +1284,13 @@ func (m *model) restartSelectedService() error {
 			return err
 		}
 		state.startedAt = time.Now()
-		return refreshComposeService(state)
+		if err := refreshComposeService(state); err != nil {
+			return err
+		}
+		if state.config.ReadyURL != "" {
+			return waitForReadiness(state.config)
+		}
+		return nil
 	}
 	if oldPID > 0 {
 		if state.ignoredExits == nil {
@@ -1221,6 +1313,26 @@ func (m *model) restartSelectedService() error {
 		state.stoppedAt = time.Now()
 		return err
 	}
+	if err := waitForReadiness(state.config); err != nil {
+		stopErr := stopProcessGroup(nextState.pid)
+		if stopErr != nil {
+			state.cmd = nextState.cmd
+			state.pid = nextState.pid
+			state.running = true
+			state.startedAt = nextState.startedAt
+			state.ignoredExits = nextState.ignoredExits
+			state.restarting = false
+			return errors.Join(err, stopErr)
+		}
+		nextState.ignoredExits[nextState.pid] = struct{}{}
+		state.running = false
+		state.pid = 0
+		state.cmd = nil
+		state.restarting = false
+		state.nextRestartAt = time.Now().Add(backoffDelay(state.restartAttempt + 1))
+		state.restartAttempt++
+		return err
+	}
 
 	state.cmd = nextState.cmd
 	state.pid = nextState.pid
@@ -1232,6 +1344,7 @@ func (m *model) restartSelectedService() error {
 	state.ignoredExits = nextState.ignoredExits
 	state.restartAttempt = 0
 	state.nextRestartAt = time.Time{}
+	state.liveFailures = 0
 	return nil
 }
 
@@ -1247,6 +1360,23 @@ func (m *model) autoRestartService(state *serviceState) error {
 		state.restartAttempt++
 		return err
 	}
+	if err := waitForReadiness(state.config); err != nil {
+		stopErr := stopProcessGroup(nextState.pid)
+		if stopErr != nil {
+			state.cmd = nextState.cmd
+			state.pid = nextState.pid
+			state.running = true
+			state.startedAt = nextState.startedAt
+			state.ignoredExits = nextState.ignoredExits
+			return errors.Join(err, stopErr)
+		}
+		state.running = false
+		state.pid = 0
+		state.cmd = nil
+		state.nextRestartAt = time.Now().Add(backoffDelay(state.restartAttempt + 1))
+		state.restartAttempt++
+		return err
+	}
 
 	state.cmd = nextState.cmd
 	state.pid = nextState.pid
@@ -1256,6 +1386,7 @@ func (m *model) autoRestartService(state *serviceState) error {
 	state.stoppedAt = time.Time{}
 	state.lastLogTail = readLogTail(state.config.LogFile, 18)
 	state.ignoredExits = nextState.ignoredExits
+	state.liveFailures = 0
 	// Don't reset restartAttempt yet — the new process may also crash. Reset on
 	// the first tick after it stays alive longer than the current backoff.
 	state.nextRestartAt = time.Time{}
@@ -1273,6 +1404,16 @@ func backoffDelay(attempt int) time.Duration {
 		d = 30 * time.Second
 	}
 	return d
+}
+
+func resetRestartBackoffAfterHealthy(state *serviceState, now time.Time) {
+	if state == nil || !state.running || state.restartAttempt == 0 || state.startedAt.IsZero() {
+		return
+	}
+	if now.Sub(state.startedAt) >= 30*time.Second {
+		state.restartAttempt = 0
+		state.nextRestartAt = time.Time{}
+	}
 }
 
 func (m model) uptimeText(state *serviceState) string {
@@ -1516,5 +1657,5 @@ func capLogFile(path string, maxBytes int64) error {
 		return err
 	}
 
-	return os.WriteFile(path, buf.Bytes(), 0o644)
+	return os.WriteFile(path, buf.Bytes(), 0o600)
 }
