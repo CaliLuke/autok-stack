@@ -32,6 +32,8 @@ func TestUISnapshot(t *testing.T) {
 		{name: "narrow-healthy", width: 70, height: 20},
 		{name: "compact-fallback", width: 50, height: 10},
 		{name: "wide-mixed-states", width: 140, height: 40, mutate: func(m *model) {
+			m.services["logal"].running = false
+			m.services["logal"].starting = true
 			m.services["server"].running = false
 			m.services["server"].exitErr = fmt.Errorf("dial tcp 127.0.0.1:5432: connect: connection refused")
 			m.services["server"].stoppedAt = time.Now()
@@ -59,6 +61,32 @@ func TestUISnapshot(t *testing.T) {
 		}},
 		{name: "wide-selected-server", width: 140, height: 40, mutate: func(m *model) {
 			m.selected = 3 // server
+		}},
+		{name: "wide-shutting-down", width: 140, height: 40, mutate: func(m *model) {
+			m.shuttingDown = true
+			m.shutdownPhase = "stopping services"
+			m.services["postgres"].keptRunning = true
+			m.services["typedb"].keptRunning = true
+			m.services["logal"].running = false
+			m.services["logal"].pid = 0
+			m.services["logal"].shutdownDone = true
+			m.services["server"].stopping = true
+			m.services["frontend"].stopping = true
+			m.selected = 3
+		}},
+		{name: "compact-shutting-down", width: 50, height: 10, mutate: func(m *model) {
+			m.shuttingDown = true
+			m.shutdownPhase = "stopping services"
+			m.services["postgres"].keptRunning = true
+			m.services["server"].stopping = true
+		}},
+		{name: "narrow-shutting-down", width: 70, height: 20, mutate: func(m *model) {
+			m.shuttingDown = true
+			m.shutdownPhase = "draining in-flight work"
+			m.services["postgres"].keptRunning = true
+			m.services["typedb"].keptRunning = true
+			m.services["server"].stopping = true
+			m.selected = 3
 		}},
 	}
 

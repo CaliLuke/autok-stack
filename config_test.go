@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -26,6 +27,22 @@ compose_services = ["postgres"]
 	want := []string{"podman", "compose"}
 	if !reflect.DeepEqual(cfg.composeCommand, want) {
 		t.Fatalf("composeCommand = %#v, want %#v", cfg.composeCommand, want)
+	}
+}
+
+func TestLoadConfigRejectsUnsafeCleanupPatterns(t *testing.T) {
+	dir := t.TempDir()
+	writeStackConfig(t, dir, `
+[stack]
+cleanup_patterns = ["scripts/dev.sh"]
+
+[[service]]
+key = "app"
+command = ["echo", "ok"]
+`)
+	_, err := loadConfig(dir)
+	if err == nil || !strings.Contains(err.Error(), "no longer supported") {
+		t.Fatalf("cleanup_patterns error = %v", err)
 	}
 }
 
@@ -114,6 +131,83 @@ command = ["echo", "project"]
 	want := filepath.Join(project, configFileName)
 	if got != want {
 		t.Fatalf("findConfigFile() = %q, want %q", got, want)
+	}
+}
+
+func TestLoadConfigRejectsUnknownDependency(t *testing.T) {
+	dir := t.TempDir()
+	writeStackConfig(t, dir, `
+[[service]]
+key = "app"
+command = ["echo", "ok"]
+depends_on = ["missing"]
+`)
+
+	if _, err := loadConfig(dir); err == nil {
+		t.Fatal("expected unknown dependency rejection")
+	}
+}
+
+func TestLoadConfigRejectsDependencyCycle(t *testing.T) {
+	dir := t.TempDir()
+	writeStackConfig(t, dir, `
+[[service]]
+key = "api"
+command = ["echo", "api"]
+depends_on = ["db"]
+
+[[service]]
+key = "db"
+command = ["echo", "db"]
+depends_on = ["api"]
+`)
+
+	if _, err := loadConfig(dir); err == nil {
+		t.Fatal("expected dependency cycle rejection")
+	}
+}
+
+func TestBuildServiceConfigExpandsHomeCommand(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	cfg, err := buildServiceConfig(t.TempDir(), t.TempDir(), serviceBlock{
+		Key:     "tool",
+		Command: []string{"~/bin/tool", "--flag"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(home, "bin", "tool")
+	if cfg.Command[0] != want {
+		t.Fatalf("command path = %q, want %q", cfg.Command[0], want)
+	}
+}
+
+func TestBuildServiceConfigKeepsBareDotCommandOnPath(t *testing.T) {
+	cfg, err := buildServiceConfig(t.TempDir(), t.TempDir(), serviceBlock{
+		Key:     "tool",
+		Command: []string{"tool.dev"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Command[0] != "tool.dev" {
+		t.Fatalf("bare command was rewritten: %q", cfg.Command[0])
+	}
+}
+
+func TestBuildServiceConfigRejectsNonPositiveReadinessTimeout(t *testing.T) {
+	for _, timeout := range []string{"0s", "-1s"} {
+		t.Run(strings.ReplaceAll(timeout, "-", "negative-"), func(t *testing.T) {
+			_, err := buildServiceConfig(t.TempDir(), t.TempDir(), serviceBlock{
+				Key:              "app",
+				Command:          []string{"app"},
+				ReadinessTimeout: timeout,
+			})
+			if err == nil {
+				t.Fatalf("expected %s to be rejected", timeout)
+			}
+		})
 	}
 }
 

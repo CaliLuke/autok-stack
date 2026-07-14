@@ -9,6 +9,7 @@ This file is for agents working on the autok-stack code. See [`README.md`](./REA
 | Path | Role |
 |---|---|
 | `main.go` | Entry point, `model` struct, all TUI rendering (`renderHero`, `renderServiceList`, `renderFocusLine`, `renderLogPanel`, `renderCompactFallback`), styles, process management, podman-compose handling, singleton lock. Single file (~1500 LOC) — kept whole because rendering and process layers share the same `model` state. |
+| `process_registry.go` | Token-verified process ownership, stale-group recovery, safe port-conflict inspection, and supervisor log events. |
 | `config.go` | TOML schema (`fileConfig`, `stackBlock`, `serviceBlock`), `loadConfig(start)` which walks up from `start` to find `stack.toml`, conversion to `[]serviceConfig`. |
 | `snapshot_test.go` | UI snapshot harness for headless polish. Driven by the `tui-snapshot-iteration` skill. |
 | `scripts/install` | Build + write `~/.local/bin/stack`. |
@@ -34,7 +35,9 @@ go vet ./...                      # sanity
 go test -run TestUISnapshot -v    # regenerate UI snapshots in .tmp/snapshots/
 ```
 
-There is no formal test suite beyond the snapshot test. Behavior is exercised manually against a real stack.toml — the snapshot test only validates the rendered string of `model.View()`, not `Update()` or any process logic.
+Behavior tests cover configuration, startup, readiness, supervision, locking,
+restart recovery, and log capping. The snapshot test separately validates the
+rendered string of `model.View()` rather than runtime process behavior.
 
 ## Making changes
 
@@ -66,7 +69,8 @@ If the field affects layout or a chip's appearance, also extend the snapshot tes
 
 ## Architecture conventions
 
-- **Fast tick is conditional.** A 100ms `spinnerTickCmd` runs only when `anyAnimating()` is true (something is `restarting` *or* the dashboard is `anyExited`). When fully healthy, the tick falls back to a 500ms heartbeat so animation resumes promptly once state changes. Don't make this always-on; redrawing a 7-row dashboard 10 times a second is cheap but pointless.
+- **Fast tick is conditional.** A 100ms `spinnerTickCmd` runs only when `anyAnimating()` is true (something is `starting`, `restarting`, or `stopping`). Otherwise it falls back to a 500ms heartbeat so animation resumes promptly once state changes. Don't make this always-on; redrawing a 7-row dashboard 10 times a second is cheap but pointless.
+- **Shutdown stays inside the TUI.** The first quit request cancels boot/restart work, streams `kept` / `stopping` / `stopped` progress through Bubble Tea, and exits only after the completion frame renders. Keep the post-`program.Run` shutdown call as an idempotent safety fallback for terminal errors and second-quit escape.
 - **Compose services persist across stack quits.** `shutdownServices` skips anything where `cfg.isComposeService()` is true. Intentional — quitting the dashboard should not tear down Postgres/TypeDB. Don't add SIGTERM-on-quit for compose without an explicit user request.
 - **Singleton lock**: `.tmp/dev-stack/stack.pid` at the consumer repo's root. `isLiveStackProcess(pid)` checks both that the PID is alive AND that its `comm` ends in `stack`, to avoid PID-collision false positives. A false positive only delays a manual override; a false negative would let two stacks fight over the same ports.
 - **Chip vs badge styles are split.** Row chips use `chipUp/Warn/Down/Danger` (foreground only — sits cleanly on the row's background, including the selected-row tint). The hero count badge uses `badgeHealthy/Warn/Danger` (background pill, more visual weight). Don't reuse one for the other or contrast breaks.
@@ -77,10 +81,9 @@ If the field affects layout or a chip's appearance, also extend the snapshot tes
 
 - Live filtering / search in the log panel
 - Per-pane resize (log panel inherits remaining vertical space; not separately resizable)
-- Persistent log archival — `.tmp/dev-stack/*.log` is capped at `MAX_LOG_BYTES` (default 1 MiB) and truncated on each stack restart
+- Historical log archival beyond one previous session — current and `.previous` logs are each bounded to one supervisor session
 - Pluggable status types beyond `live` / `restart` / `exit` / `down`
-- Snapshot-test coverage of `Update()` (only `View()` is tested)
-- A proper integration test suite — the snapshot harness is structural only
+- Full terminal-runtime integration coverage; the snapshot harness remains structural only
 
 ## Commit / publish conventions
 
