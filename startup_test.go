@@ -134,7 +134,7 @@ func TestBeginBootServicesReturnsBeforeReadiness(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	started := time.Now()
-	services, order, results, done := beginBootServices(ctx, []serviceConfig{
+	services, order, results, done := beginBootServices(ctx, nil, []serviceConfig{
 		testBootService(t.TempDir(), "slow", server.URL),
 	}, make(chan processExitMsg, 2), 1024*1024)
 	if elapsed := time.Since(started); elapsed > 50*time.Millisecond {

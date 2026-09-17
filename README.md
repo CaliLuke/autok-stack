@@ -44,10 +44,11 @@ compose_command = ["podman", "compose"]     # optional, defaults to podman compo
 [[service]]
 key = "server"
 name = "Server"
-ports = ["8000"]                            # checked for readiness; unrelated listeners are never killed
+ports = ["8000"]                            # preferred TCP ports; conflicts select a free port
 work_dir = "backend"
 log_file = "server.log"
 command = ["./dev.sh"]
+env = { API_PORT = "{{port}}" }              # optional service-specific environment
 depends_on = ["postgres"]                    # optional; dependency cycles are rejected
 readiness_timeout = "5s"                    # optional, default 5s
 ready_url = "http://localhost:8000/readyz"   # optional authoritative startup check
@@ -71,8 +72,8 @@ Every command service starts behind a stack-owned process-group leader with a
 random ownership token recorded in `.tmp/dev-stack/processes.json`. After an
 unclean supervisor exit, the next stack instance reclaims a surviving group only
 when that leader still presents the exact token in its process identity. PID or
-command-name matches alone are never used as proof. If an unrelated process owns a declared port, startup fails with its
-PID and command instead of terminating it. The legacy `cleanup_patterns` option
+command-name matches alone are never used as proof. If an unrelated process owns a declared command-service port, stack selects a free port.
+It leaves the unrelated process running. The legacy `cleanup_patterns` option
 is rejected because its broad `pkill -f` behavior cannot establish ownership.
 
 Services whose dependencies are ready start concurrently. A failed service only
@@ -105,6 +106,43 @@ are written into the corresponding service log.
 required_tools = ["go", "bun", "docker"]
 compose_command = ["docker", "compose"]
 ```
+
+## Port allocation
+
+Command services use their declared ports when those ports are free. If a port is occupied, stack searches upward for a free TCP port. It skips other declared ports and ports assigned within the same stack session. The dashboard, local health URLs, and supervisor logs show the assigned ports.
+
+For a single-port command service, stack sets `PORT` to the assigned port. Programs that use another variable or a command argument need an explicit binding:
+
+```toml
+ports = ["8000"]
+command = ["./dev.sh"]
+env = { API_PORT = "{{port}}" }
+# Alternatively: command = ["server", "--port", "{{port}}"]
+```
+
+The `env` table overrides inherited variables for command services. Startup scripts must preserve these values when they load dotenv files. Stack cannot change a port hardcoded inside a program or script.
+
+Port references work in `env` values, command arguments, `ready_url`, and `live_url`:
+
+| Reference | Value |
+| --- | --- |
+| `{{port}}` | The first assigned port of this service |
+| `{{port:4318}}` | This service's assigned replacement for declared port 4318 |
+| `{{port:server:8000}}` | The server service's assigned replacement for declared port 8000 |
+
+Services with multiple ports need a binding for each port that can change. For example:
+
+```toml
+ports = ["4317", "4318"]
+command = ["collector"]
+env = { GRPC_ENDPOINT = "127.0.0.1:{{port:4317}}", HTTP_ENDPOINT = "127.0.0.1:{{port:4318}}" }
+```
+
+Consumers can use `env = { API_URL = "http://localhost:{{port:server:8000}}" }` to track a provider's endpoint. References do not add startup dependencies. Use `depends_on` when a consumer requires the provider to be ready.
+
+An ordinary restart retains the assigned ports. If another process takes an assigned port, stack selects a replacement. Running command services whose configured references change restart with the new values, even without `auto_restart`.
+
+Compose-published ports remain under the Compose file's control. Stack does not remap them. Port probes close before process launch, so another application can still take a port between the probe and the bind.
 
 ## Keys
 

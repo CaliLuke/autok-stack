@@ -217,3 +217,28 @@ func writeStackConfig(t *testing.T, dir, content string) {
 		t.Fatal(err)
 	}
 }
+
+func TestLoadConfigPortEnvironmentReferences(t *testing.T) {
+	root := t.TempDir()
+	text := `[[service]]
+key = "server"
+ports = ["8000"]
+command = ["server", "--port", "{{port}}"]
+ready_url = "http://localhost:{{port}}/ready"
+env = { API_PORT = "{{port}}" }
+[[service]]
+key = "client"
+command = ["client"]
+env = { API_URL = "http://localhost:{{port:server:8000}}" }
+`
+	if err := os.WriteFile(filepath.Join(root, "stack.toml"), []byte(text), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.services[0].Env["API_PORT"] != "{{port}}" || cfg.services[1].Env["API_URL"] != "http://localhost:{{port:server:8000}}" {
+		t.Fatal("port templates were not preserved")
+	}
+}

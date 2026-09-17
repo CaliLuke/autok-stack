@@ -31,6 +31,15 @@ func TestUISnapshot(t *testing.T) {
 		{name: "medium-healthy", width: 100, height: 28},
 		{name: "narrow-healthy", width: 70, height: 20},
 		{name: "compact-fallback", width: 50, height: 10},
+		{name: "wide-reassigned-ports", width: 140, height: 40, mutate: func(m *model) {
+			m.services["server"].config.Ports = []string{"8001"}
+			m.services["logal"].config.Ports = []string{"14317", "14318", "13134"}
+			m.services["server"].lastLogTail = "[stack] port 8000 occupied; using 8001"
+			m.selected = 3
+		}},
+		{name: "compact-reassigned-ports", width: 50, height: 10, mutate: func(m *model) {
+			m.services["server"].config.Ports = []string{"8001"}
+		}},
 		{name: "wide-mixed-states", width: 140, height: 40, mutate: func(m *model) {
 			m.services["logal"].running = false
 			m.services["logal"].starting = true

@@ -33,6 +33,8 @@ type serviceConfig struct {
 	WorkDir         string
 	LogFile         string
 	Command         []string
+	Env             map[string]string
+	portPlan        *portPlan
 	ComposeFile     string
 	ComposeServices []string
 	ComposeCommand  []string
@@ -48,7 +50,7 @@ type serviceConfig struct {
 
 type serviceState struct {
 	config         serviceConfig
-	cmd            *exec.Cmd
+	process        *serviceProcess
 	pid            int
 	running        bool
 	starting       bool
@@ -62,11 +64,15 @@ type serviceState struct {
 	nextRestartAt  time.Time
 	composeDown    bool
 	liveFailures   int
-	ownerToken     string
 	stopping       bool
 	shutdownDone   bool
 	keptRunning    bool
 	shutdownErr    error
+}
+
+type serviceGeneration struct {
+	key        string
+	generation uint64
 }
 
 type processExitMsg struct {
@@ -224,7 +230,7 @@ type model struct {
 	cancel        context.CancelFunc
 	operations    *operationTracker
 	healthBusy    bool
-	earlyExits    map[uint64]error
+	earlyExits    map[serviceGeneration]error
 	interrupted   bool
 	bootResults   <-chan serviceBootResultMsg
 	bootRemaining int
@@ -234,79 +240,6 @@ type model struct {
 	shutdownPhase string
 	shutdownErr   error
 	shutdownCh    <-chan shutdownProgressMsg
-}
-
-type operationTracker struct {
-	mu      sync.Mutex
-	cond    *sync.Cond
-	running int
-	closed  bool
-	pending map[int]*serviceState
-}
-
-func newOperationTracker() *operationTracker {
-	tracker := &operationTracker{pending: make(map[int]*serviceState)}
-	tracker.cond = sync.NewCond(&tracker.mu)
-	return tracker
-}
-
-func (t *operationTracker) command(run func() tea.Msg) tea.Cmd {
-	return func() tea.Msg {
-		t.mu.Lock()
-		if t.closed {
-			t.mu.Unlock()
-			return nil
-		}
-		t.running++
-		t.mu.Unlock()
-		defer func() {
-			t.mu.Lock()
-			t.running--
-			t.cond.Broadcast()
-			t.mu.Unlock()
-		}()
-		return run()
-	}
-}
-
-func (t *operationTracker) track(state *serviceState) {
-	if state == nil || state.pid <= 0 {
-		return
-	}
-	t.mu.Lock()
-	t.pending[state.pid] = state
-	t.mu.Unlock()
-}
-
-func (t *operationTracker) release(pid int) {
-	if pid <= 0 {
-		return
-	}
-	t.mu.Lock()
-	delete(t.pending, pid)
-	t.mu.Unlock()
-}
-
-func (t *operationTracker) waitAndStopPending() error {
-	t.mu.Lock()
-	t.closed = true
-	for t.running > 0 {
-		t.cond.Wait()
-	}
-	states := make([]*serviceState, 0, len(t.pending))
-	for _, state := range t.pending {
-		states = append(states, state)
-	}
-	t.pending = make(map[int]*serviceState)
-	t.mu.Unlock()
-
-	var errs []error
-	for _, state := range states {
-		if err := stopProcessGroup(state.pid); err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", state.config.Name, err))
-		}
-	}
-	return errors.Join(errs...)
 }
 
 func main() {
@@ -380,7 +313,7 @@ func main() {
 	}
 	runtimeCtx, cancelRuntime := context.WithCancel(context.Background())
 	operations := newOperationTracker()
-	services, order, bootResults, bootDone := beginBootServices(runtimeCtx, cfg.services, exitCh, maxLogBytes)
+	services, order, bootResults, bootDone := beginBootServices(runtimeCtx, operations, cfg.services, exitCh, maxLogBytes)
 
 	m := model{
 		rootDir:       cfg.rootDir,
@@ -395,7 +328,7 @@ func main() {
 		runtimeCtx:    runtimeCtx,
 		cancel:        cancelRuntime,
 		operations:    operations,
-		earlyExits:    make(map[uint64]error),
+		earlyExits:    make(map[serviceGeneration]error),
 		bootResults:   bootResults,
 		bootRemaining: len(cfg.services),
 		bootDone:      bootDone,
@@ -628,8 +561,12 @@ func prepareLogs(configs []serviceConfig) error {
 
 // beginBootServices starts dependency-ready services in the background and
 // returns immediately so the dashboard can render boot progress.
-func beginBootServices(ctx context.Context, configs []serviceConfig, exitCh chan<- processExitMsg, maxLogBytes int64) (map[string]*serviceState, []string, <-chan serviceBootResultMsg, <-chan struct{}) {
+func beginBootServices(ctx context.Context, tracker *operationTracker, configs []serviceConfig, exitCh chan<- processExitMsg, maxLogBytes int64) (map[string]*serviceState, []string, <-chan serviceBootResultMsg, <-chan struct{}) {
 	configs = dependencyOrderedConfigs(configs)
+	plan := newPortPlan(configs)
+	for i := range configs {
+		configs[i].portPlan = plan
+	}
 	nodes := make(map[string]*serviceBootNode, len(configs))
 	services := make(map[string]*serviceState, len(configs))
 	order := make([]string, 0, len(configs))
@@ -663,6 +600,7 @@ func beginBootServices(ctx context.Context, configs []serviceConfig, exitCh chan
 	finish := func(cfg serviceConfig, state *serviceState, err error) {
 		state.starting = false
 		state.generation = 1
+		tracker.track(state)
 		node := nodes[cfg.Key]
 		node.state = state
 		node.err = err
@@ -770,7 +708,7 @@ func dependencyOrderedConfigs(configs []serviceConfig) []serviceConfig {
 // bootServices is the synchronous test/compatibility wrapper around the
 // production streaming boot path.
 func bootServices(ctx context.Context, configs []serviceConfig, exitCh chan<- processExitMsg, maxLogBytes int64) (map[string]*serviceState, []string, bool) {
-	services, order, results, done := beginBootServices(ctx, configs, exitCh, maxLogBytes)
+	services, order, results, done := beginBootServices(ctx, nil, configs, exitCh, maxLogBytes)
 	failed := false
 	for result := range results {
 		services[result.key] = result.state
@@ -793,13 +731,14 @@ func bootService(ctx context.Context, cfg serviceConfig, exitCh chan<- processEx
 }
 
 func finishBootService(ctx context.Context, cfg serviceConfig, state *serviceState) (*serviceState, error) {
+	cfg = state.config
 	if !cfg.isComposeService() {
 		state.lastLogTail = readLogTail(cfg.LogFile, 18)
 	}
 	if err := waitForReadinessContext(ctx, cfg); err != nil {
 		bootErr := fmt.Errorf("readiness: %w", err)
 		if !cfg.isComposeService() {
-			if stopErr := stopProcessGroupContext(ctx, state.pid); stopErr != nil {
+			if stopErr := state.process.stop(ctx); stopErr != nil {
 				bootErr = errors.Join(bootErr, stopErr)
 				state.running = false
 				state.exitErr = bootErr
@@ -832,13 +771,25 @@ func startServiceContext(ctx context.Context, cfg serviceConfig, exitCh chan<- p
 		return startComposeServiceContext(ctx, cfg)
 	}
 
-	if err := ensurePortsAvailable(ctx, cfg); err != nil {
+	if cfg.portPlan == nil {
+		cfg.portPlan = newPortPlan([]serviceConfig{cfg})
+	}
+	resolved, err := cfg.portPlan.prepare(ctx, cfg.Key)
+	if err != nil {
 		return nil, err
 	}
+	cfg = resolved
 
 	logFile, err := openCappedLogWriter(cfg.LogFile, maxLogBytes)
 	if err != nil {
 		return nil, err
+	}
+
+	for i, port := range cfg.Ports {
+		preferred := cfg.portPlan.originals[cfg.Key].Ports[i]
+		if port != preferred {
+			_, _ = fmt.Fprintf(logFile, "[stack] port %s occupied; using %s\n", preferred, port)
+		}
 	}
 
 	ownerToken, err := newProcessOwnerToken()
@@ -857,9 +808,11 @@ func startServiceContext(ctx context.Context, cfg serviceConfig, exitCh chan<- p
 	}
 	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Dir = cfg.WorkDir
+	cmd.Env = serviceEnvironment(cfg)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = processPipeDrainTimeout
 
 	if err := cmd.Start(); err != nil {
 		_ = logFile.Close()
@@ -885,24 +838,30 @@ func startServiceContext(ctx context.Context, cfg serviceConfig, exitCh chan<- p
 	}
 	_, _ = fmt.Fprintf(logFile, "[stack] started pid=%d generation=%d at=%s\n", cmd.Process.Pid, generation, time.Now().Format(time.RFC3339Nano))
 
+	process := &serviceProcess{pid: cmd.Process.Pid}
 	state := &serviceState{
 		config:     cfg,
-		cmd:        cmd,
+		process:    process,
 		pid:        cmd.Process.Pid,
 		running:    true,
 		startedAt:  time.Now(),
 		generation: generation,
-		ownerToken: ownerToken,
 	}
 
 	go func(key, token string, child *exec.Cmd, file *cappedLogWriter, generation uint64) {
 		err := child.Wait()
+		// WaitDelay guarantees inherited output pipes cannot postpone cleanup.
+		cleanupErr := process.stop(context.Background())
+		err = errors.Join(err, cleanupErr)
 		if closeErr := file.Close(); closeErr != nil && err == nil {
 			err = closeErr
 		}
 		_ = appendSupervisorEvent(cfg.LogFile, "process exited pid=%d generation=%d error=%q", child.Process.Pid, generation, errorText(err))
 		if cfg.registry != nil {
-			if cleanupErr := cfg.registry.removeExited(key, child.Process.Pid, token); cleanupErr != nil {
+			if cleanupErr == nil {
+				cleanupErr = cfg.registry.removeIfMatch(key, child.Process.Pid, token)
+			}
+			if cleanupErr != nil {
 				err = errors.Join(err, cleanupErr)
 				_ = appendSupervisorEvent(cfg.LogFile, "process cleanup failed pid=%d generation=%d error=%q", child.Process.Pid, generation, cleanupErr.Error())
 			}
@@ -1008,7 +967,7 @@ func beginShutdownServices(services map[string]*serviceState, order []string, in
 			for _, key := range layer {
 				state := services[key]
 				go func(key string, state *serviceState) {
-					err := stopProcessGroup(state.cmd.Process.Pid)
+					err := state.process.stop(context.Background())
 					if err != nil {
 						err = fmt.Errorf("%s: %w", state.config.Name, err)
 					}
@@ -1071,7 +1030,7 @@ func shutdownServiceLayers(services map[string]*serviceState, order []string) []
 	pending := make(map[string]*serviceState)
 	for _, key := range order {
 		state := services[key]
-		if state == nil || state.config.isComposeService() || state.cmd == nil || state.cmd.Process == nil {
+		if state == nil || state.config.isComposeService() || state.process == nil {
 			continue
 		}
 		pending[key] = state
@@ -1293,6 +1252,7 @@ func (cfg serviceConfig) composeCommandContext(ctx context.Context, args ...stri
 	}
 	cmd := exec.CommandContext(ctx, command[0], append(command[1:], args...)...)
 	cmd.Dir = cfg.WorkDir
+	configureHelperProcess(cmd)
 	return cmd
 }
 
@@ -1532,9 +1492,9 @@ func healthCheckCmd(ctx context.Context, tracker *operationTracker, services map
 	})
 }
 
-func restartServiceCmd(ctx context.Context, tracker *operationTracker, key string, cfg serviceConfig, oldPID int, generation uint64, maxLogBytes int64, exitCh chan<- processExitMsg) tea.Cmd {
+func restartServiceCmd(ctx context.Context, tracker *operationTracker, key string, cfg serviceConfig, previous *serviceProcess, generation uint64, maxLogBytes int64, exitCh chan<- processExitMsg) tea.Cmd {
 	return tracker.command(func() tea.Msg {
-		result := restartResultMsg{key: key, generation: generation, oldStopped: oldPID <= 0}
+		result := restartResultMsg{key: key, generation: generation, oldStopped: previous == nil}
 		if cfg.isComposeService() {
 			if err := restartComposeServicesContext(ctx, cfg); err != nil {
 				result.err = err
@@ -1559,8 +1519,8 @@ func restartServiceCmd(ctx context.Context, tracker *operationTracker, key strin
 			return result
 		}
 
-		if oldPID > 0 {
-			if err := stopProcessGroupContext(ctx, oldPID); err != nil {
+		if previous != nil {
+			if err := previous.stop(ctx); err != nil {
 				result.err = err
 				return result
 			}
@@ -1577,10 +1537,10 @@ func restartServiceCmd(ctx context.Context, tracker *operationTracker, key strin
 			return result
 		}
 		tracker.track(next)
-		if err := waitForReadinessContext(ctx, cfg); err != nil {
-			stopErr := stopProcessGroupContext(ctx, next.pid)
+		if err := waitForReadinessContext(ctx, next.config); err != nil {
+			stopErr := next.process.stop(ctx)
 			if stopErr == nil {
-				tracker.release(next.pid)
+				tracker.release(next.process)
 				result.err = err
 				return result
 			}
@@ -1596,9 +1556,9 @@ func restartServiceCmd(ctx context.Context, tracker *operationTracker, key strin
 	})
 }
 
-func stopServiceCmd(ctx context.Context, tracker *operationTracker, key string, pid int, generation uint64) tea.Cmd {
+func stopServiceCmd(ctx context.Context, tracker *operationTracker, key string, process *serviceProcess, generation uint64) tea.Cmd {
 	return tracker.command(func() tea.Msg {
-		return stopResultMsg{key: key, pid: pid, generation: generation, err: stopProcessGroupContext(ctx, pid)}
+		return stopResultMsg{key: key, pid: process.pid, generation: generation, err: process.stop(ctx)}
 	})
 }
 
@@ -1761,7 +1721,7 @@ func (m *model) applyShutdownProgress(msg shutdownProgressMsg) {
 		if msg.err == nil {
 			state.running = false
 			state.pid = 0
-			state.cmd = nil
+			state.process = nil
 			state.shutdownDone = true
 			state.stoppedAt = time.Now()
 		}
@@ -1771,42 +1731,37 @@ func (m *model) applyShutdownProgress(msg shutdownProgressMsg) {
 func (m *model) applyRestartResult(msg restartResultMsg) {
 	state := m.services[msg.key]
 	if state == nil {
-		if msg.next != nil {
-			m.operations.release(msg.next.pid)
-		}
 		return
 	}
 	if msg.generation <= state.generation {
-		if msg.next != nil {
-			m.operations.release(msg.next.pid)
-		}
 		return
 	}
 	preservedAttempt := state.restartAttempt
 	state.restarting = false
 
 	if msg.next != nil {
-		m.operations.release(msg.next.pid)
+		m.operations.release(msg.next.process)
 		*state = *msg.next
 		state.restartAttempt = preservedAttempt
-		if earlyErr, exited := m.earlyExits[state.generation]; exited {
-			delete(m.earlyExits, state.generation)
+		if earlyErr, exited := m.earlyExits[serviceGeneration{msg.key, state.generation}]; exited {
+			delete(m.earlyExits, serviceGeneration{msg.key, state.generation})
 			state.running = false
 			if earlyErr == nil {
 				earlyErr = errors.New("process exited during restart")
 			}
 			state.exitErr = earlyErr
+			state.retireStoppedProcess()
 			state.stoppedAt = time.Now()
 			msg.err = earlyErr
 		}
 	} else {
-		delete(m.earlyExits, msg.generation)
+		delete(m.earlyExits, serviceGeneration{msg.key, msg.generation})
 		if msg.oldStopped {
 			state.generation = msg.generation
 		}
 	}
 	if msg.next == nil && msg.oldStopped {
-		state.cmd = nil
+		state.process = nil
 		state.pid = 0
 		state.running = false
 		state.stoppedAt = time.Now()
@@ -1827,7 +1782,7 @@ func (m *model) applyRestartResult(msg restartResultMsg) {
 	state.running = true
 	state.exitErr = nil
 	state.stoppedAt = time.Time{}
-	state.restartAttempt = 0
+	// Preserve crash history until the healthy-window check resets it.
 	state.nextRestartAt = time.Time{}
 	state.liveFailures = 0
 }
@@ -1838,14 +1793,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		state := m.services[msg.key]
 		if state != nil && state.starting {
 			*state = *msg.state
-			if earlyErr, exited := m.earlyExits[state.generation]; exited {
-				delete(m.earlyExits, state.generation)
+			m.operations.release(state.process)
+			if earlyErr, exited := m.earlyExits[serviceGeneration{msg.key, state.generation}]; exited {
+				delete(m.earlyExits, serviceGeneration{msg.key, state.generation})
 				if msg.err == nil {
 					if earlyErr == nil {
 						earlyErr = errors.New("process exited during startup")
 					}
 					state.running = false
 					state.exitErr = earlyErr
+					state.retireStoppedProcess()
 					state.stoppedAt = time.Now()
 				}
 			}
@@ -1921,7 +1878,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			state.restarting = true
 			m.anyExited = m.currentlyDegraded()
-			return m, restartServiceCmd(m.runtimeCtx, m.operations, state.config.Key, state.config, state.pid, state.generation+1, m.maxLogBytes, m.exitCh)
+			return m, restartServiceCmd(m.runtimeCtx, m.operations, state.config.Key, state.config, state.process, state.generation+1, m.maxLogBytes, m.exitCh)
 		}
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -1952,6 +1909,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				resetRestartBackoffAfterHealthy(state, now)
 			}
+			if state.running && !state.restarting && !m.shuttingDown && !state.config.isComposeService() && state.config.portPlan != nil && state.config.portPlan.changed(state.config) && m.dependenciesReady(state.config) == nil {
+				state.restarting = true
+				commands = append(commands, restartServiceCmd(m.runtimeCtx, m.operations, state.config.Key, state.config, state.process, state.generation+1, m.maxLogBytes, m.exitCh))
+				continue
+			}
 			if state.config.AutoRestart && !state.running && !state.restarting && !m.shuttingDown {
 				if !state.nextRestartAt.IsZero() && now.Before(state.nextRestartAt) {
 					continue
@@ -1960,7 +1922,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					continue
 				}
 				state.restarting = true
-				commands = append(commands, restartServiceCmd(m.runtimeCtx, m.operations, state.config.Key, state.config, 0, state.generation+1, m.maxLogBytes, m.exitCh))
+				commands = append(commands, restartServiceCmd(m.runtimeCtx, m.operations, state.config.Key, state.config, state.process, state.generation+1, m.maxLogBytes, m.exitCh))
 			}
 		}
 		if !m.healthBusy && !m.shuttingDown {
@@ -2011,15 +1973,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			state.exitErr = fmt.Errorf("liveness failed: %w", result.err)
 			state.restarting = true
-			commands = append(commands, stopServiceCmd(m.runtimeCtx, m.operations, state.config.Key, state.pid, state.generation))
+			commands = append(commands, stopServiceCmd(m.runtimeCtx, m.operations, state.config.Key, state.process, state.generation))
 		}
 		m.anyExited = m.currentlyDegraded()
 		return m, tea.Batch(commands...)
 	case restartResultMsg:
 		if m.shuttingDown {
-			if msg.next != nil {
-				m.operations.release(msg.next.pid)
-			}
+			// The tracker owns discarded results until their processes are stopped.
 			return m, nil
 		}
 		m.applyRestartResult(msg)
@@ -2034,7 +1994,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				state.liveFailures = 0
 			} else {
 				state.running = false
-				state.cmd = nil
+				state.process = nil
 				state.pid = 0
 				state.stoppedAt = time.Now()
 				state.restartAttempt++
@@ -2053,9 +2013,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if msg.generation > state.generation {
 				if m.earlyExits == nil {
-					m.earlyExits = make(map[uint64]error)
+					m.earlyExits = make(map[serviceGeneration]error)
 				}
-				m.earlyExits[msg.generation] = msg.err
+				m.earlyExits[serviceGeneration{msg.key, msg.generation}] = msg.err
 				return m, waitForExitCmd(m.exitCh)
 			}
 			if state.pid != msg.pid {
@@ -2063,6 +2023,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			state.running = false
 			state.restarting = false
+			state.retireStoppedProcess()
 			state.exitErr = msg.err
 			state.stoppedAt = time.Now()
 			state.lastLogTail = readLogTail(state.config.LogFile, 18)
@@ -2454,7 +2415,7 @@ func backoffDelay(attempt int) time.Duration {
 }
 
 func resetRestartBackoffAfterHealthy(state *serviceState, now time.Time) {
-	if state == nil || !state.running || state.restartAttempt == 0 || state.startedAt.IsZero() {
+	if state == nil || !state.running || state.starting || state.restarting || state.exitErr != nil || state.liveFailures > 0 || state.restartAttempt == 0 || state.startedAt.IsZero() {
 		return
 	}
 	if now.Sub(state.startedAt) >= 30*time.Second {

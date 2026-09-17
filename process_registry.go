@@ -108,37 +108,6 @@ func (r *processRegistry) removeIfMatch(key string, pid int, token string) error
 	return nil
 }
 
-func (r *processRegistry) removeExited(key string, pid int, token string) error {
-	if r == nil {
-		return nil
-	}
-	record, ok := r.record(key)
-	if !ok || record.PID != pid || record.Token != token {
-		return nil
-	}
-	alive, _, err := inspectProcessGroup(record)
-	if err != nil {
-		return err
-	}
-	// The active supervisor just reaped the token-bearing group leader, so it
-	// still has direct lifecycle authority over any descendants left in that
-	// same group. Remove them now; otherwise the token proof disappears with the
-	// wrapper and a future stack must conservatively treat them as unrelated.
-	if alive {
-		if err := stopProcessGroup(record.PGID); err != nil {
-			return fmt.Errorf("stop descendants left by %s process group %d: %w", key, record.PGID, err)
-		}
-	}
-	return r.removeIfMatch(key, pid, token)
-}
-
-func (r *processRegistry) record(key string) (processRecord, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	record, ok := r.records[key]
-	return record, ok
-}
-
 func (r *processRegistry) snapshot() []processRecord {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -305,6 +274,15 @@ type portOwner struct {
 	command string
 }
 
+type portContentionError struct {
+	details string
+	owners  []portOwner
+}
+
+func (e *portContentionError) Error() string {
+	return "refusing to terminate unrelated port owner; " + e.details
+}
+
 func ensurePortsAvailable(ctx context.Context, cfg serviceConfig) error {
 	if len(cfg.Ports) == 0 {
 		return nil
@@ -348,7 +326,7 @@ func ensurePortsAvailable(ctx context.Context, cfg serviceConfig) error {
 	for _, owner := range owners {
 		details = append(details, fmt.Sprintf("port %s: pid %d (%s)", owner.port, owner.pid, owner.command))
 	}
-	return fmt.Errorf("refusing to terminate unrelated port owner; %s", strings.Join(details, "; "))
+	return &portContentionError{details: strings.Join(details, "; "), owners: owners}
 }
 
 func listeningPortOwners(ctx context.Context, ports []string) ([]portOwner, error) {

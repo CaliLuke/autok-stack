@@ -116,7 +116,7 @@ func TestRestartCommandStopsReplacementThatNeverBecomesReady(t *testing.T) {
 		ReadinessTimeout: 50 * time.Millisecond,
 	}
 	tracker := newOperationTracker()
-	message := restartServiceCmd(context.Background(), tracker, cfg.Key, cfg, 0, 1, 1024*1024, make(chan processExitMsg, 2))().(restartResultMsg)
+	message := restartServiceCmd(context.Background(), tracker, cfg.Key, cfg, nil, 1, 1024*1024, make(chan processExitMsg, 2))().(restartResultMsg)
 	if message.err == nil {
 		t.Fatal("expected readiness failure")
 	}
@@ -144,7 +144,7 @@ func TestRestartResultResetsLivenessFailures(t *testing.T) {
 		liveFailures: 3,
 	}
 	m := testSupervisorModel(map[string]*serviceState{"recovering": state}, []string{"recovering"})
-	message := restartServiceCmd(m.runtimeCtx, m.operations, state.config.Key, state.config, 0, 1, m.maxLogBytes, m.exitCh)().(restartResultMsg)
+	message := restartServiceCmd(m.runtimeCtx, m.operations, state.config.Key, state.config, nil, 1, m.maxLogBytes, m.exitCh)().(restartResultMsg)
 	if message.err != nil {
 		t.Fatal(message.err)
 	}

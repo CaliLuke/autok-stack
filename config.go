@@ -33,19 +33,20 @@ type stackBlock struct {
 }
 
 type serviceBlock struct {
-	Key              string   `toml:"key"`
-	Name             string   `toml:"name"`
-	DependsOn        []string `toml:"depends_on"`
-	Ports            []string `toml:"ports"`
-	WorkDir          string   `toml:"work_dir"`
-	LogFile          string   `toml:"log_file"`
-	Command          []string `toml:"command"`
-	ComposeFile      string   `toml:"compose_file"`
-	ComposeServices  []string `toml:"compose_services"`
-	AutoRestart      bool     `toml:"auto_restart"`
-	ReadinessTimeout string   `toml:"readiness_timeout"`
-	ReadyURL         string   `toml:"ready_url"`
-	LiveURL          string   `toml:"live_url"`
+	Key              string            `toml:"key"`
+	Name             string            `toml:"name"`
+	DependsOn        []string          `toml:"depends_on"`
+	Ports            []string          `toml:"ports"`
+	WorkDir          string            `toml:"work_dir"`
+	LogFile          string            `toml:"log_file"`
+	Command          []string          `toml:"command"`
+	Env              map[string]string `toml:"env"`
+	ComposeFile      string            `toml:"compose_file"`
+	ComposeServices  []string          `toml:"compose_services"`
+	AutoRestart      bool              `toml:"auto_restart"`
+	ReadinessTimeout string            `toml:"readiness_timeout"`
+	ReadyURL         string            `toml:"ready_url"`
+	LiveURL          string            `toml:"live_url"`
 }
 
 type loadedConfig struct {
@@ -143,6 +144,10 @@ func loadConfig(start string) (*loadedConfig, error) {
 		return nil, fmt.Errorf("invalid service dependencies: %w", err)
 	}
 
+	if err := validatePortConfig(services); err != nil {
+		return nil, err
+	}
+
 	return &loadedConfig{
 		rootDir:        rootDir,
 		title:          title,
@@ -211,10 +216,10 @@ func buildServiceConfig(rootDir, logDir string, s serviceBlock) (serviceConfig, 
 		}
 		readiness = d
 	}
-	if err := validateHealthURL("ready_url", s.ReadyURL); err != nil {
+	if err := validateHealthURL("ready_url", portReference.ReplaceAllString(s.ReadyURL, "12345")); err != nil {
 		return serviceConfig{}, fmt.Errorf("%s: %w", s.Key, err)
 	}
-	if err := validateHealthURL("live_url", s.LiveURL); err != nil {
+	if err := validateHealthURL("live_url", portReference.ReplaceAllString(s.LiveURL, "12345")); err != nil {
 		return serviceConfig{}, fmt.Errorf("%s: %w", s.Key, err)
 	}
 
@@ -226,6 +231,7 @@ func buildServiceConfig(rootDir, logDir string, s serviceBlock) (serviceConfig, 
 		WorkDir:          workDir,
 		LogFile:          logFile,
 		Command:          command,
+		Env:              s.Env,
 		ComposeFile:      composeFile,
 		ComposeServices:  s.ComposeServices,
 		AutoRestart:      s.AutoRestart,

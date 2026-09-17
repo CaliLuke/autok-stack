@@ -311,11 +311,11 @@ func TestProcessExitBeforeBootResultIsApplied(t *testing.T) {
 }
 
 func TestShutdownLayersStopConsumersBeforeProviders(t *testing.T) {
-	process := func(pid int) *exec.Cmd { return &exec.Cmd{Process: &os.Process{Pid: pid}} }
+	process := func(pid int) *serviceProcess { return &serviceProcess{pid: pid} }
 	services := map[string]*serviceState{
-		"db":     {config: serviceConfig{Key: "db"}, cmd: process(1)},
-		"api":    {config: serviceConfig{Key: "api", DependsOn: []string{"db"}}, cmd: process(2)},
-		"worker": {config: serviceConfig{Key: "worker", DependsOn: []string{"db"}}, cmd: process(3)},
+		"db":     {config: serviceConfig{Key: "db"}, process: process(1)},
+		"api":    {config: serviceConfig{Key: "api", DependsOn: []string{"db"}}, process: process(2)},
+		"worker": {config: serviceConfig{Key: "worker", DependsOn: []string{"db"}}, process: process(3)},
 	}
 	layers := shutdownServiceLayers(services, []string{"db", "api", "worker"})
 	if len(layers) != 2 || strings.Join(layers[0], ",") != "worker,api" || strings.Join(layers[1], ",") != "db" {
@@ -394,7 +394,7 @@ func TestShutdownProgressReportsStoppingBeforeStopped(t *testing.T) {
 	services := map[string]*serviceState{
 		"app": {
 			config:  serviceConfig{Key: "app", Name: "App"},
-			cmd:     cmd,
+			process: &serviceProcess{pid: cmd.Process.Pid},
 			pid:     cmd.Process.Pid,
 			running: true,
 		},
@@ -430,7 +430,7 @@ func testSupervisorModel(services map[string]*serviceState, order []string) mode
 		runtimeCtx:  ctx,
 		cancel:      cancel,
 		operations:  newOperationTracker(),
-		earlyExits:  make(map[uint64]error),
+		earlyExits:  make(map[serviceGeneration]error),
 		maxLogBytes: 1024 * 1024,
 	}
 }
