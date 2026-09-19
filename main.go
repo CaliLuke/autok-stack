@@ -222,6 +222,8 @@ type model struct {
 	shuttingDown  bool
 	anyExited     bool
 	selected      int
+	lastWheelAt   time.Time
+	lastWheel     tea.MouseButton
 	width         int
 	height        int
 	styles        styles
@@ -334,7 +336,7 @@ func main() {
 		bootDone:      bootDone,
 	}
 
-	program := tea.NewProgram(m, tea.WithAltScreen())
+	program := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	programDone := make(chan struct{})
 	go func() {
 		for {
@@ -1880,6 +1882,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.anyExited = m.currentlyDegraded()
 			return m, restartServiceCmd(m.runtimeCtx, m.operations, state.config.Key, state.config, state.process, state.generation+1, m.maxLogBytes, m.exitCh)
 		}
+	case tea.MouseMsg:
+		m.handleMouse(msg, time.Now())
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -2212,6 +2216,11 @@ func (m model) columnWidths(width int) (nameW, portsW, pidW, ageW, statusW int) 
 }
 
 func (m model) renderServiceList(width int) string {
+	return strings.Join(m.serviceListRows(width), "\n")
+}
+
+// Keep hit testing and rendering on the same rows, including wrapped content.
+func (m model) serviceListRows(width int) []string {
 	nameW, portsW, pidW, ageW, statusW := m.columnWidths(width)
 
 	headerFmt := fmt.Sprintf("  %%-%ds  %%-%ds  %%-%ds  %%-%ds  %%-%ds", nameW, portsW, pidW, ageW, statusW)
@@ -2247,7 +2256,70 @@ func (m model) renderServiceList(width int) string {
 		}
 		rows = append(rows, row)
 	}
-	return strings.Join(rows, "\n")
+	return rows
+}
+
+// serviceAt returns the service under a terminal cell, excluding other panels.
+func (m model) serviceAt(x, y int) (int, bool) {
+	if x < 0 || x >= m.width || y < 0 || y >= m.height {
+		return 0, false
+	}
+	// Bubble Tea keeps the bottom of a view when it exceeds the terminal height.
+	y += max(0, lipgloss.Height(m.View())-m.height)
+	if m.width < 60 || m.height < 12 {
+		index := y - lipgloss.Height(m.title+"\nresize terminal for dashboard mode\n")
+		return index, index >= 0 && index < len(m.order)
+	}
+	width := max(60, m.width-2)
+	left := m.styles.app.GetMarginLeft() + m.styles.app.GetBorderLeftSize() + m.styles.app.GetPaddingLeft()
+	if x < left || x >= left+width {
+		return 0, false
+	}
+	top := m.styles.app.GetMarginTop() + m.styles.app.GetBorderTopSize() + m.styles.app.GetPaddingTop()
+	rows := m.serviceListRows(width)
+	top += lipgloss.Height(m.renderHero(width)) + lipgloss.Height(rows[0])
+	row := 1
+	for i, key := range m.order {
+		if m.services[key] == nil {
+			continue
+		}
+		height := lipgloss.Height(rows[row])
+		if y >= top && y < top+height {
+			return i, true
+		}
+		top += height
+		row++
+	}
+	return 0, false
+}
+
+const wheelStepInterval = 100 * time.Millisecond
+
+func (m *model) handleMouse(msg tea.MouseMsg, now time.Time) {
+	if m.shuttingDown || len(m.order) == 0 || msg.Action != tea.MouseActionPress {
+		return
+	}
+	switch msg.Button {
+	case tea.MouseButtonLeft:
+		if index, ok := m.serviceAt(msg.X, msg.Y); ok {
+			m.selected = index
+			m.lastWheelAt = time.Time{}
+			m.refreshSelectedLog()
+		}
+	case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown:
+		// Terminals and trackpads can emit a burst for one wheel gesture.
+		// Limit same-direction repeats, but let a reversal take effect immediately.
+		if msg.Button == m.lastWheel && now.Sub(m.lastWheelAt) < wheelStepInterval {
+			return
+		}
+		m.lastWheelAt, m.lastWheel = now, msg.Button
+		delta := 1
+		if msg.Button == tea.MouseButtonWheelUp {
+			delta = -1
+		}
+		m.selected = max(0, min(len(m.order)-1, m.selected+delta))
+		m.refreshSelectedLog()
+	}
 }
 
 func (m model) statusChip(state *serviceState, width int) string {
