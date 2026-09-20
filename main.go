@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -246,9 +247,27 @@ type model struct {
 	shutdownCh    <-chan shutdownProgressMsg
 }
 
+var version = "dev"
+
 func main() {
 	if len(os.Args) >= 4 && os.Args[1] == serviceWrapperArg {
 		os.Exit(runServiceWrapper(os.Args[3:]))
+	}
+
+	showVersion := flag.Bool("version", false, "Print the stack version and exit")
+	flag.Usage = func() {
+		fmt.Fprintln(flag.CommandLine.Output(), "Usage: stack [--version] [--help]")
+		fmt.Fprintln(flag.CommandLine.Output(), "\nRun from a repository with stack.toml, or set STACK_DEFAULT_DIR.")
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+	if *showVersion {
+		fmt.Printf("stack %s\n", version)
+		return
+	}
+	if flag.NArg() != 0 {
+		flag.Usage()
+		os.Exit(2)
 	}
 
 	cwd, err := os.Getwd()

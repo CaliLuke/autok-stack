@@ -6,6 +6,28 @@ It was originally bolted into the autok monorepo as `stack-terminal/` with hardc
 
 ## Install
 
+Install with Homebrew on macOS or Linux:
+
+```bash
+brew install caliluke/stack/stack
+stack --version
+```
+
+Homebrew builds the release from source and installs Go as a build dependency.
+Install the tools required by your services separately, such as Podman, Bun, or Node.js.
+
+To update:
+
+```bash
+brew update
+brew upgrade caliluke/stack/stack
+```
+
+If you previously installed `~/.local/bin/stack`, check `which -a stack`.
+Remove the old binary or put the Homebrew bin directory first on your `PATH`.
+
+To build from a checkout instead:
+
 ```bash
 ./scripts/install
 ```
