@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/muesli/termenv"
 )
@@ -31,6 +32,18 @@ func TestUISnapshot(t *testing.T) {
 		{name: "medium-healthy", width: 100, height: 28},
 		{name: "narrow-healthy", width: 70, height: 20},
 		{name: "compact-fallback", width: 50, height: 10},
+		{name: "wide-text-selection", width: 140, height: 40, mutate: func(m *model) {
+			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+			*m = updated.(model)
+		}},
+		{name: "narrow-text-selection", width: 70, height: 20, mutate: func(m *model) {
+			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+			*m = updated.(model)
+		}},
+		{name: "compact-text-selection", width: 50, height: 10, mutate: func(m *model) {
+			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+			*m = updated.(model)
+		}},
 		{name: "wide-reassigned-ports", width: 140, height: 40, mutate: func(m *model) {
 			m.services["server"].config.Ports = []string{"8001"}
 			m.services["logal"].config.Ports = []string{"14317", "14318", "13134"}

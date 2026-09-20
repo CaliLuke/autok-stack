@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -137,6 +138,66 @@ func TestMouseDisabledDuringShutdownAndWithoutServices(t *testing.T) {
 			if updated.(model).selected != 0 {
 				t.Fatal("mouse changed selection")
 			}
+		}
+	}
+}
+
+func TestTextSelectionReleasesMouseAndKeepsDisplayStill(t *testing.T) {
+	m := mouseTestModel(t, 100, 28)
+	toggle := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}}
+	updated, cmd := m.Update(toggle)
+	m = updated.(model)
+	if !m.selectingText || cmd == nil || reflect.TypeOf(cmd()) != reflect.TypeOf(tea.DisableMouse()) {
+		t.Fatal("text selection did not release terminal mouse capture")
+	}
+	frozen := m.View()
+	if !strings.Contains(frozen, "m resume") {
+		t.Fatal("missing text selection instructions")
+	}
+	m.services["postgres"].lastLogTail = "new output while selecting"
+	updated, _ = m.Update(spinnerTickMsg(time.Now()))
+	m = updated.(model)
+	if m.spinnerFrame != 1 || m.View() != frozen {
+		t.Fatal("background updates must continue without changing the displayed text")
+	}
+	for _, msg := range []tea.Msg{
+		tea.MouseMsg{Button: tea.MouseButtonWheelDown},
+		tea.KeyMsg{Type: tea.KeyDown},
+	} {
+		updated, _ = m.Update(msg)
+		m = updated.(model)
+		if m.selected != 0 || m.View() != frozen {
+			t.Fatal("input changed the view during text selection")
+		}
+	}
+	updated, cmd = m.Update(toggle)
+	m = updated.(model)
+	if m.selectingText || cmd == nil || reflect.TypeOf(cmd()) != reflect.TypeOf(tea.EnableMouseCellMotion()) {
+		t.Fatal("resume did not restore mouse capture")
+	}
+	if !strings.Contains(m.View(), "new output while selecting") {
+		t.Fatal("resume did not display the latest output")
+	}
+	updated, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown})
+	if updated.(model).selected != 1 {
+		t.Fatal("wheel navigation did not resume")
+	}
+}
+
+func TestTextSelectionResizeAndQuit(t *testing.T) {
+	for _, quit := range []tea.Msg{tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}}, shutdownMsg{}} {
+		m := mouseTestModel(t, 100, 28)
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
+		m = updated.(model)
+		updated, _ = m.Update(tea.WindowSizeMsg{Width: 50, Height: 10})
+		m = updated.(model)
+		if !m.selectingText || !strings.Contains(m.View(), "resize terminal") || !strings.Contains(m.View(), "m resume") {
+			t.Fatal("resize did not refresh text selection mode")
+		}
+		updated, _ = m.Update(quit)
+		m = updated.(model)
+		if m.selectingText || m.selectionView != "" || !m.shuttingDown {
+			t.Fatal("quit did not leave text selection for visible shutdown")
 		}
 	}
 }

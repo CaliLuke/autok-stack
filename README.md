@@ -146,10 +146,16 @@ Compose-published ports remain under the Compose file's control. Stack does not 
 
 ## Keys
 
+- Click a service row to select its logs. The mouse wheel moves one service at a time.
+- `m` — switch between mouse navigation and terminal text selection
 - `j` / `k` — move selection
 - `g` / `G` — jump to first / last
 - `r` — restart selected service
 - `q` / `Ctrl+C` — quit
+
+To copy logs, press `m`, select text, and use your terminal's usual copy command.
+The display stays still while services continue to run.
+Press `m` again to show the latest output and restore mouse navigation.
 
 ## Environment
 

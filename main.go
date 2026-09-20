@@ -224,6 +224,8 @@ type model struct {
 	selected      int
 	lastWheelAt   time.Time
 	lastWheel     tea.MouseButton
+	selectingText bool
+	selectionView string
 	width         int
 	height        int
 	styles        styles
@@ -1823,6 +1825,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case shutdownMsg:
+		m.selectingText, m.selectionView = false, ""
 		return m.requestShutdown(true)
 	case shutdownReadyMsg:
 		m.shutdownReady = true
@@ -1847,6 +1850,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case shutdownQuitMsg:
 		return m, tea.Quit
 	case tea.KeyMsg:
+		if msg.String() == "m" && !m.shuttingDown {
+			m.selectingText = !m.selectingText
+			m.selectionView = ""
+			m.lastWheelAt = time.Time{}
+			if m.selectingText {
+				// Keep the displayed text still while terminal-native selection is active.
+				// Supervision continues through Update in the background.
+				m.selectionView = m.View()
+				return m, tea.DisableMouse
+			}
+			return m, tea.EnableMouseCellMotion
+		}
+		if m.selectingText {
+			if msg.String() != "q" && msg.String() != "ctrl+c" {
+				return m, nil
+			}
+			m.selectingText, m.selectionView = false, ""
+		}
 		if m.shuttingDown && msg.String() != "ctrl+c" && msg.String() != "q" {
 			return m, nil
 		}
@@ -1887,6 +1908,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		if m.selectingText {
+			m.selectionView = ""
+			m.selectionView = m.View()
+		}
 	case spinnerTickMsg:
 		m.spinnerFrame++
 		if m.anyAnimating() {
@@ -2048,6 +2073,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
+	if m.selectingText && m.selectionView != "" {
+		return m.selectionView
+	}
 	if m.width < 60 || m.height < 12 {
 		return m.renderCompactFallback()
 	}
@@ -2113,6 +2141,9 @@ func (m model) renderCompactFallback() string {
 		b.WriteString("no log output yet\n")
 	} else {
 		b.WriteString(selected.lastLogTail)
+	}
+	if m.selectingText {
+		b.WriteString("\nselect text to copy · m resume · q quit\n")
 	}
 	return b.String()
 }
@@ -2296,7 +2327,7 @@ func (m model) serviceAt(x, y int) (int, bool) {
 const wheelStepInterval = 100 * time.Millisecond
 
 func (m *model) handleMouse(msg tea.MouseMsg, now time.Time) {
-	if m.shuttingDown || len(m.order) == 0 || msg.Action != tea.MouseActionPress {
+	if m.selectingText || m.shuttingDown || len(m.order) == 0 || msg.Action != tea.MouseActionPress {
 		return
 	}
 	switch msg.Button {
@@ -2429,15 +2460,19 @@ func (m model) renderLogPanel(state *serviceState, width, height int) string {
 }
 
 func (m model) renderFooter(width int) string {
-	keysText := "j/k move · g/G jump · r restart · q quit"
+	keysText := "j/k move · m select text · r restart · q quit"
 	if m.shuttingDown {
 		keysText = "shutting down · q again hides progress"
+	}
+	if m.selectingText {
+		keysText = "select text to copy · m resume · q quit"
 	}
 	keys := m.styles.muted.Render(keysText)
 	rightText := m.logDir
 	if m.shuttingDown {
 		rightText = "please wait"
 	}
+	rightText = truncateText(rightText, max(0, width-lipgloss.Width(keys)-1))
 	right := m.styles.muted.Render(rightText)
 	gap := width - lipgloss.Width(keys) - lipgloss.Width(right)
 	if gap < 1 {
