@@ -87,6 +87,7 @@ If the field affects layout or a chip's appearance, also extend the snapshot tes
 
 ## Commit / publish conventions
 
+- For GitHub releases and Homebrew updates, use [`.agents/skills/release-stack/SKILL.md`](./.agents/skills/release-stack/SKILL.md). It covers the source archive and the dedicated `CaliLuke/homebrew-stack` tap.
 - Per the parent monorepo: do not add `Co-Authored-By`, `Generated with Claude`, or similar attribution to commits. This is a paid tool, not a collaborator.
 - Commit messages: explain *why*, not *what* — the diff says what changed. Two-paragraph form is fine; lead with the motivation, follow with the mechanical detail if it's non-obvious.
 - The binary at `/autok-stack` (the literal `go build` default output) and the install target at `/stack` are both gitignored.
