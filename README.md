@@ -76,6 +76,7 @@ readiness_timeout = "5s"                    # optional, default 5s
 ready_url = "http://localhost:8000/readyz"   # optional authoritative startup check
 live_url = "http://localhost:8000/livez"     # optional steady-state health check
 auto_restart = false                        # optional, exp-backoff restart on crash
+autostart = true                            # optional, false keeps the service inactive at launch
 
 # A podman/docker compose service group:
 [[service]]
@@ -89,6 +90,34 @@ compose_services = ["postgres", "pgbouncer"]
 ```
 
 A service is either a `command` (plain process) or a `compose_services` list (managed via `compose_command`). Compose services aren't torn down when you quit the dashboard.
+
+### Optional services
+
+Set `autostart = false` for services that you only need occasionally:
+
+```toml
+[[service]]
+key = "storybook"
+name = "Storybook"
+work_dir = "frontend"
+command = ["bun", "run", "storybook", "--port", "{{port}}"]
+ports = ["6006"]
+autostart = false
+auto_restart = true
+```
+
+Optional services appear as `inactive` and do not affect stack health or the live-service count.
+Select a service and press `s` to start it. The footer shows the Start action.
+Stack starts its required dependencies first, then uses the normal port allocation, readiness checks, logs, health checks, and shutdown handling.
+If startup or a dependency fails, the dashboard shows the failure. Press `s` to retry the service and its failed dependencies.
+
+An automatically started service also starts its dependencies, even those with `autostart = false`.
+The `auto_restart` setting only applies after a service is requested or needed as a dependency.
+On each stack launch, optional services start inactive again unless an automatic service needs them.
+Compose containers kept from an earlier session remain running externally until managed again through Start.
+If you omit `autostart`, the service starts automatically.
+
+### Process supervision
 
 Every command service starts behind a stack-owned process-group leader with a
 random ownership token recorded in `.tmp/dev-stack/processes.json`. After an
@@ -173,6 +202,7 @@ Compose-published ports remain under the Compose file's control. Stack does not 
 - `j` / `k` — move selection
 - `g` / `G` — jump to first / last
 - `r` — restart selected service
+- `s` — start the selected inactive or stopped service and its dependencies, or retry a failed start
 - `q` / `Ctrl+C` — quit
 
 To copy logs, press `m`, select text, and use your terminal's usual copy command.

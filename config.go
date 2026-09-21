@@ -44,6 +44,7 @@ type serviceBlock struct {
 	ComposeFile      string            `toml:"compose_file"`
 	ComposeServices  []string          `toml:"compose_services"`
 	AutoRestart      bool              `toml:"auto_restart"`
+	Autostart        *bool             `toml:"autostart"`
 	ReadinessTimeout string            `toml:"readiness_timeout"`
 	ReadyURL         string            `toml:"ready_url"`
 	LiveURL          string            `toml:"live_url"`
@@ -235,6 +236,7 @@ func buildServiceConfig(rootDir, logDir string, s serviceBlock) (serviceConfig, 
 		ComposeFile:      composeFile,
 		ComposeServices:  s.ComposeServices,
 		AutoRestart:      s.AutoRestart,
+		ManualStart:      s.Autostart != nil && !*s.Autostart,
 		ReadinessTimeout: readiness,
 		ReadyURL:         s.ReadyURL,
 		LiveURL:          s.LiveURL,

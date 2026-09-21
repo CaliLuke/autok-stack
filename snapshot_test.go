@@ -32,6 +32,21 @@ func TestUISnapshot(t *testing.T) {
 		{name: "medium-healthy", width: 100, height: 28},
 		{name: "narrow-healthy", width: 70, height: 20},
 		{name: "compact-fallback", width: 50, height: 10},
+		{name: "wide-optional", width: 140, height: 40, mutate: optionalScene},
+		{name: "narrow-optional", width: 70, height: 20, mutate: optionalScene},
+		{name: "compact-optional", width: 50, height: 10, mutate: optionalScene},
+		{name: "optional-waiting", width: 100, height: 28, mutate: func(m *model) {
+			optionalScene(m)
+			m.selectedState().inactive = false
+			m.selectedState().startPending = true
+			m.selectedState().config.DependsOn = []string{"server"}
+		}},
+		{name: "optional-failed", width: 100, height: 28, mutate: func(m *model) {
+			optionalScene(m)
+			m.selectedState().inactive = false
+			m.selectedState().exitErr = fmt.Errorf("dependency server failed: readiness timeout")
+			m.anyExited = true
+		}},
 		{name: "wide-text-selection", width: 140, height: 40, mutate: func(m *model) {
 			updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'m'}})
 			*m = updated.(model)
@@ -133,6 +148,15 @@ func TestUISnapshot(t *testing.T) {
 		}
 		t.Logf("wrote %s", path)
 	}
+}
+
+func optionalScene(m *model) {
+	for _, key := range []string{"frontend", "admin"} {
+		cfg := m.services[key].config
+		cfg.ManualStart = true
+		m.services[key] = &serviceState{config: cfg, inactive: true}
+	}
+	m.selected = len(m.order) - 1
 }
 
 func newFakeModel() model {

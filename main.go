@@ -41,6 +41,8 @@ type serviceConfig struct {
 	ComposeCommand  []string
 	// AutoRestart enables exponential-backoff restart of crashed processes.
 	AutoRestart bool
+	// ManualStart excludes this service from boot unless a dependency needs it.
+	ManualStart bool
 	// ReadinessTimeout bounds how long startup waits for the service to become ready.
 	ReadinessTimeout time.Duration
 	// ReadyURL is authoritative when configured; a listening port alone is not readiness.
@@ -55,6 +57,8 @@ type serviceState struct {
 	pid            int
 	running        bool
 	starting       bool
+	inactive       bool
+	startPending   bool
 	restarting     bool
 	generation     uint64
 	exitErr        error
@@ -586,6 +590,7 @@ func prepareLogs(configs []serviceConfig) error {
 // returns immediately so the dashboard can render boot progress.
 func beginBootServices(ctx context.Context, tracker *operationTracker, configs []serviceConfig, exitCh chan<- processExitMsg, maxLogBytes int64) (map[string]*serviceState, []string, <-chan serviceBootResultMsg, <-chan struct{}) {
 	configs = dependencyOrderedConfigs(configs)
+	wanted := startupServices(configs)
 	plan := newPortPlan(configs)
 	for i := range configs {
 		configs[i].portPlan = plan
@@ -595,7 +600,7 @@ func beginBootServices(ctx context.Context, tracker *operationTracker, configs [
 	order := make([]string, 0, len(configs))
 	for _, cfg := range configs {
 		nodes[cfg.Key] = &serviceBootNode{done: make(chan struct{})}
-		services[cfg.Key] = &serviceState{config: cfg, starting: true}
+		services[cfg.Key] = &serviceState{config: cfg, starting: wanted[cfg.Key], inactive: !wanted[cfg.Key]}
 		order = append(order, cfg.Key)
 	}
 
@@ -604,6 +609,9 @@ func beginBootServices(ctx context.Context, tracker *operationTracker, configs [
 	}
 	groups := make(map[string]*bootGroup)
 	for _, cfg := range configs {
+		if !wanted[cfg.Key] {
+			continue
+		}
 		key := "process\x00" + cfg.Key
 		if cfg.isComposeService() {
 			key = "compose\x00" + composeProjectKey(cfg) + "\x00" + strings.Join(cfg.DependsOn, "\x00")
@@ -644,6 +652,12 @@ func beginBootServices(ctx context.Context, tracker *operationTracker, configs [
 			}
 		}
 		return nil
+	}
+	// Inactive rows still emit a result so boot completion includes the catalog.
+	for _, cfg := range configs {
+		if !wanted[cfg.Key] {
+			finish(cfg, &serviceState{config: cfg, inactive: true}, nil)
+		}
 	}
 
 	for _, group := range groups {
@@ -964,7 +978,7 @@ func beginShutdownServices(services map[string]*serviceState, order []string, in
 		}
 		for _, key := range order {
 			state := services[key]
-			if state == nil {
+			if state == nil || state.inactive {
 				continue
 			}
 			if state.config.isComposeService() {
@@ -1421,7 +1435,7 @@ func healthCheckCmd(ctx context.Context, tracker *operationTracker, services map
 	}
 	configs := make([]healthSnapshot, 0, len(services))
 	for _, state := range services {
-		if state == nil || state.starting || state.restarting {
+		if state == nil || state.inactive || state.startPending || state.starting || state.restarting {
 			continue
 		}
 		if !state.config.isComposeService() && !state.running {
@@ -1664,7 +1678,7 @@ func (m model) Init() tea.Cmd {
 // Avoids burning a 100ms tick when the dashboard is not showing a spinner.
 func (m model) anyAnimating() bool {
 	for _, s := range m.services {
-		if s != nil && (s.starting || s.restarting || s.stopping) {
+		if s != nil && (s.startPending || s.starting || s.restarting || s.stopping) {
 			return true
 		}
 	}
@@ -1683,7 +1697,7 @@ func (m model) dependenciesReady(cfg serviceConfig) error {
 
 func (m model) currentlyDegraded() bool {
 	for _, state := range m.services {
-		if state != nil && state.starting {
+		if state != nil && (state.inactive || state.startPending || state.starting) {
 			continue
 		}
 		if state == nil || !state.running || state.restarting || state.exitErr != nil {
@@ -1725,6 +1739,7 @@ func (m *model) applyShutdownProgress(msg shutdownProgressMsg) {
 	if state == nil {
 		return
 	}
+	state.startPending = false
 	switch msg.phase {
 	case "kept":
 		state.starting = false
@@ -1761,6 +1776,7 @@ func (m *model) applyRestartResult(msg restartResultMsg) {
 	}
 	preservedAttempt := state.restartAttempt
 	state.restarting = false
+	state.starting = false
 
 	if msg.next != nil {
 		m.operations.release(msg.next.process)
@@ -1811,10 +1827,16 @@ func (m *model) applyRestartResult(msg restartResultMsg) {
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	updated, command := m.update(msg)
+	next := updated.(model)
+	return next.advanceStarts(command)
+}
+
+func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case serviceBootResultMsg:
 		state := m.services[msg.key]
-		if state != nil && state.starting {
+		if state != nil && state.starting && !msg.state.inactive {
 			*state = *msg.state
 			m.operations.release(state.process)
 			if earlyErr, exited := m.earlyExits[serviceGeneration{msg.key, state.generation}]; exited {
@@ -1907,9 +1929,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.selected = len(m.order) - 1
 			}
 			m.refreshSelectedLog()
+		case "s":
+			if state := m.selectedState(); state != nil && !state.running {
+				m.requestStart(state.config.Key)
+			}
 		case "r":
 			state := m.selectedState()
-			if state == nil || state.starting || state.restarting {
+			if state == nil || state.startPending || state.starting || state.restarting {
+				break
+			}
+			if state.inactive {
+				m.requestStart(state.config.Key)
 				break
 			}
 			if err := m.dependenciesReady(state.config); err != nil {
@@ -1948,7 +1978,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			selectedKey = selected.config.Key
 		}
 		for _, state := range m.services {
-			if state.starting {
+			if state.inactive || state.startPending || state.starting {
 				continue
 			}
 			if !state.config.isComposeService() {
@@ -1989,7 +2019,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var commands []tea.Cmd
 		for _, result := range msg.results {
 			state := m.services[result.key]
-			if state == nil || state.starting || state.restarting || state.generation != result.generation {
+			if state == nil || state.inactive || state.startPending || state.starting || state.restarting || state.generation != result.generation {
 				continue
 			}
 			if state.config.isComposeService() {
@@ -2140,6 +2170,10 @@ func (m model) renderCompactFallback() string {
 			status = "● kept"
 		case state.shutdownDone:
 			status = "◯ stopped"
+		case state.inactive:
+			status = "◯ inactive"
+		case state.startPending:
+			status = spinnerGlyph(m.spinnerFrame) + " waiting"
 		case state.starting:
 			status = spinnerGlyph(m.spinnerFrame) + " starting"
 		case state.restarting:
@@ -2156,21 +2190,30 @@ func (m model) renderCompactFallback() string {
 	}
 	b.WriteString("\n")
 	b.WriteString(fmt.Sprintf("selected: %s\n", selected.config.LogFile))
-	if selected.lastLogTail == "" {
+	if selected.inactive {
+		b.WriteString("Optional service. Press s to start.\n")
+	} else if selected.lastLogTail == "" {
 		b.WriteString("no log output yet\n")
 	} else {
 		b.WriteString(selected.lastLogTail)
 	}
 	if m.selectingText {
 		b.WriteString("\nselect text to copy · m resume · q quit\n")
+	} else if !m.shuttingDown {
+		b.WriteString("\n" + m.actionHint() + " · q quit\n")
 	}
 	return b.String()
 }
 
 func (m model) renderHero(width int) string {
-	upCount := 0
+	upCount, activeCount := 0, 0
 	for _, key := range m.order {
-		if state := m.services[key]; state != nil && state.running {
+		state := m.services[key]
+		if state != nil && state.inactive {
+			continue
+		}
+		activeCount++
+		if state != nil && state.running {
 			upCount++
 		}
 	}
@@ -2178,7 +2221,10 @@ func (m model) renderHero(width int) string {
 	// Healthy: solid green pill. Degraded: alternate danger/warn each 500ms
 	// (5 spinner frames) so the eye is drawn to the count without it being
 	// a frenetic flash.
-	badgeText := fmt.Sprintf(" %d/%d live ", upCount, len(m.order))
+	badgeText := fmt.Sprintf(" %d/%d live ", upCount, activeCount)
+	if activeCount == 0 {
+		badgeText = " all inactive "
+	}
 	var badge string
 	if m.shuttingDown {
 		badgeText = " shutting down "
@@ -2393,6 +2439,12 @@ func (m model) statusChip(state *serviceState, width int) string {
 		glyph = "◯"
 		label = "stopped"
 		style = m.styles.chipDown
+	case state.inactive:
+		label = "inactive"
+	case state.startPending:
+		glyph = spinnerGlyph(m.spinnerFrame)
+		label = "waiting"
+		style = m.styles.chipWarn
 	case state.starting:
 		glyph = spinnerGlyph(m.spinnerFrame)
 		label = "starting"
@@ -2431,6 +2483,8 @@ func (m model) renderFocusLine(state *serviceState, width int) string {
 	if m.shuttingDown {
 		var message string
 		switch {
+		case state.inactive:
+			message = state.config.Name + " remains inactive."
 		case state.stopping:
 			message = "Stopping " + state.config.Name + " gracefully…"
 		case state.shutdownErr != nil:
@@ -2445,6 +2499,12 @@ func (m model) renderFocusLine(state *serviceState, width int) string {
 		return lipgloss.NewStyle().Width(width).Render("  " + truncateText(message, max(20, width-4)))
 	}
 
+	if state.inactive {
+		return "  Inactive · press s to start"
+	}
+	if state.startPending {
+		return "  " + truncateText("Waiting for dependencies: "+strings.Join(state.config.DependsOn, ", "), max(0, width-4))
+	}
 	cmd := state.config.commandText()
 	logRel := state.config.LogFile
 	if rel, err := filepath.Rel(m.rootDir, logRel); err == nil {
@@ -2469,7 +2529,9 @@ func (m model) renderFocusLine(state *serviceState, width int) string {
 
 func (m model) renderLogPanel(state *serviceState, width, height int) string {
 	logContent := state.lastLogTail
-	if strings.TrimSpace(logContent) == "" {
+	if state.inactive {
+		logContent = "Optional service. Press s to start it and its dependencies."
+	} else if strings.TrimSpace(logContent) == "" {
 		logContent = "No output yet. Waiting for the process to write to its log file."
 	}
 	innerW := max(8, width-4)
@@ -2478,8 +2540,18 @@ func (m model) renderLogPanel(state *serviceState, width, height int) string {
 	return m.styles.logBox.Width(width - 2).Height(height - 1).Render(logContent)
 }
 
+func (m model) actionHint() string {
+	if state := m.selectedState(); state != nil && !state.running {
+		if state.exitErr != nil {
+			return "s retry start · r restart"
+		}
+		return "s start · r restart"
+	}
+	return "r restart"
+}
+
 func (m model) renderFooter(width int) string {
-	keysText := "j/k move · m select text · r restart · q quit"
+	keysText := "j/k move · m select text · " + m.actionHint() + " · q quit"
 	if m.shuttingDown {
 		keysText = "shutting down · q again hides progress"
 	}
