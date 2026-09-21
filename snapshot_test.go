@@ -32,6 +32,9 @@ func TestUISnapshot(t *testing.T) {
 		{name: "medium-healthy", width: 100, height: 28},
 		{name: "narrow-healthy", width: 70, height: 20},
 		{name: "compact-fallback", width: 50, height: 10},
+		{name: "wide-info", width: 140, height: 40, mutate: showInfoScene},
+		{name: "narrow-info", width: 70, height: 20, mutate: showInfoScene},
+		{name: "compact-info", width: 50, height: 10, mutate: showInfoScene},
 		{name: "wide-optional", width: 140, height: 40, mutate: optionalScene},
 		{name: "narrow-optional", width: 70, height: 20, mutate: optionalScene},
 		{name: "compact-optional", width: 50, height: 10, mutate: optionalScene},
@@ -147,6 +150,30 @@ func TestUISnapshot(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Logf("wrote %s", path)
+	}
+}
+
+func showInfoScene(m *model) {
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	*m = updated.(model)
+}
+
+func TestInfoScreenOpensAndCloses(t *testing.T) {
+	m := newFakeModel()
+	m.width, m.height = 100, 28
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	opened := updated.(model)
+	if !opened.showingInfo {
+		t.Fatal("info screen did not open")
+	}
+	if !strings.Contains(stripANSI(opened.View()), "version  "+version) {
+		t.Fatalf("info screen did not render the build version: %q", stripANSI(opened.View()))
+	}
+
+	updated, _ = opened.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if updated.(model).showingInfo {
+		t.Fatal("info screen did not close on escape")
 	}
 }
 

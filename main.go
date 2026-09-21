@@ -231,6 +231,7 @@ type model struct {
 	lastWheel     tea.MouseButton
 	selectingText bool
 	selectionView string
+	showingInfo   bool
 	width         int
 	height        int
 	styles        styles
@@ -1891,6 +1892,21 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case shutdownQuitMsg:
 		return m, tea.Quit
 	case tea.KeyMsg:
+		if m.showingInfo {
+			switch msg.String() {
+			case "i", "esc":
+				m.showingInfo = false
+				return m, nil
+			case "ctrl+c", "q":
+				return m.requestShutdown(false)
+			default:
+				return m, nil
+			}
+		}
+		if msg.String() == "i" && !m.shuttingDown && !m.selectingText {
+			m.showingInfo = true
+			return m, nil
+		}
 		if msg.String() == "m" && !m.shuttingDown {
 			m.selectingText = !m.selectingText
 			m.selectionView = ""
@@ -2122,6 +2138,9 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
+	if m.showingInfo {
+		return m.renderInfoScreen()
+	}
 	if m.selectingText && m.selectionView != "" {
 		return m.selectionView
 	}
@@ -2147,6 +2166,25 @@ func (m model) View() string {
 	logs := m.renderLogPanel(selected, width, logHeight)
 	layout := lipgloss.JoinVertical(lipgloss.Left, hero, list, focus, logs, footer)
 	return m.styles.app.Render(layout)
+}
+
+// renderInfoScreen is a small, service-independent view for build and runtime
+// details. It deliberately keeps a stable shape so more information can be
+// added without changing the dashboard's supervision layout.
+func (m model) renderInfoScreen() string {
+	width := max(24, m.width-2)
+	title := m.styles.heroTitle.Render(m.title + " · INFO")
+	label := m.styles.muted.Render("version")
+	build := m.styles.kpiValue.Render(version)
+	help := m.styles.muted.Render("i / esc return · q quit")
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		title,
+		"",
+		"  "+label+"  "+build,
+		"",
+		"  "+help,
+	)
+	return m.styles.app.Render(m.styles.heroHealthy.Width(width).Render(content))
 }
 
 func (m model) renderCompactFallback() string {
@@ -2200,7 +2238,7 @@ func (m model) renderCompactFallback() string {
 	if m.selectingText {
 		b.WriteString("\nselect text to copy · m resume · q quit\n")
 	} else if !m.shuttingDown {
-		b.WriteString("\n" + m.actionHint() + " · q quit\n")
+		b.WriteString("\ni info · " + m.actionHint() + " · q quit\n")
 	}
 	return b.String()
 }
@@ -2392,7 +2430,7 @@ func (m model) serviceAt(x, y int) (int, bool) {
 const wheelStepInterval = 100 * time.Millisecond
 
 func (m *model) handleMouse(msg tea.MouseMsg, now time.Time) {
-	if m.selectingText || m.shuttingDown || len(m.order) == 0 || msg.Action != tea.MouseActionPress {
+	if m.showingInfo || m.selectingText || m.shuttingDown || len(m.order) == 0 || msg.Action != tea.MouseActionPress {
 		return
 	}
 	switch msg.Button {
@@ -2551,7 +2589,7 @@ func (m model) actionHint() string {
 }
 
 func (m model) renderFooter(width int) string {
-	keysText := "j/k move · m select text · " + m.actionHint() + " · q quit"
+	keysText := "j/k move · i info · m select text · " + m.actionHint() + " · q quit"
 	if m.shuttingDown {
 		keysText = "shutting down · q again hides progress"
 	}

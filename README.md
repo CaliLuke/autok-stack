@@ -51,6 +51,11 @@ export STACK_DEFAULT_DIR="$HOME/code/myproject"
 
 The nearest `stack.toml` still wins when you are inside another stack-managed repo.
 
+### Dashboard keys
+
+Press `i` to open the information screen, which currently shows the running
+binary version. Press `i` again or `Esc` to return to the dashboard.
+
 ## Config — `stack.toml`
 
 All non-absolute paths are resolved relative to the directory containing `stack.toml`. `log_file` is always relative to `log_dir`.
