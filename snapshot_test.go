@@ -32,6 +32,13 @@ func TestUISnapshot(t *testing.T) {
 		{name: "medium-healthy", width: 100, height: 28},
 		{name: "narrow-healthy", width: 70, height: 20},
 		{name: "compact-fallback", width: 50, height: 10},
+		{name: "wide-links", width: 140, height: 40, mutate: linkScene},
+		{name: "narrow-links", width: 70, height: 20, mutate: linkScene},
+		{name: "compact-links", width: 50, height: 10, mutate: linkScene},
+		{name: "link-open-error", width: 70, height: 20, mutate: func(m *model) {
+			linkScene(m)
+			m.linkError = "Could not open link: exit status 1"
+		}},
 		{name: "wide-info", width: 140, height: 40, mutate: showInfoScene},
 		{name: "narrow-info", width: 70, height: 20, mutate: showInfoScene},
 		{name: "compact-info", width: 50, height: 10, mutate: showInfoScene},
@@ -175,6 +182,11 @@ func TestInfoScreenOpensAndCloses(t *testing.T) {
 	if updated.(model).showingInfo {
 		t.Fatal("info screen did not close on escape")
 	}
+}
+
+func linkScene(m *model) {
+	m.selected = 4
+	m.selectedState().lastLogTail = "  ➜ Local: http://localhost:3000/\n  ➜ Docs:  https://example.com/docs"
 }
 
 func optionalScene(m *model) {

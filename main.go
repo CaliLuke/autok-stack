@@ -24,6 +24,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 type serviceConfig struct {
@@ -232,6 +233,7 @@ type model struct {
 	selectingText bool
 	selectionView string
 	showingInfo   bool
+	linkError     string
 	width         int
 	height        int
 	styles        styles
@@ -1891,6 +1893,12 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForShutdownProgressCmd(m.shutdownCh)
 	case shutdownQuitMsg:
 		return m, tea.Quit
+	case linkOpenedMsg:
+		m.linkError = ""
+		if msg.err != nil {
+			m.linkError = "Could not open link: " + msg.err.Error()
+		}
+		return m, nil
 	case tea.KeyMsg:
 		if m.showingInfo {
 			switch msg.String() {
@@ -1929,6 +1937,12 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		switch msg.String() {
+		case "o":
+			m.linkError = ""
+			if links := m.visibleLinks(); len(links) > 0 {
+				return m, openLinkCmd(links[0].url)
+			}
+			m.linkError = "No complete HTTP(S) link visible in these logs."
 		case "ctrl+c", "q":
 			return m.requestShutdown(false)
 		case "up", "k":
@@ -1969,6 +1983,14 @@ func (m model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, restartServiceCmd(m.runtimeCtx, m.operations, state.config.Key, state.config, state.process, state.generation+1, m.maxLogBytes, m.exitCh)
 		}
 	case tea.MouseMsg:
+		if !m.showingInfo && !m.selectingText && !m.shuttingDown && msg.Button == tea.MouseButtonLeft && msg.Action == tea.MouseActionPress {
+			for _, link := range m.visibleLinks() {
+				if msg.Y == link.y && msg.X >= link.x && msg.X < link.endX {
+					m.linkError = ""
+					return m, openLinkCmd(link.url)
+				}
+			}
+		}
 		m.handleMouse(msg, time.Now())
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
@@ -2236,9 +2258,13 @@ func (m model) renderCompactFallback() string {
 		b.WriteString(selected.lastLogTail)
 	}
 	if m.selectingText {
-		b.WriteString("\nselect text to copy · m resume · q quit\n")
+		b.WriteString("\n" + textSelectionHint + "\n")
 	} else if !m.shuttingDown {
 		b.WriteString("\ni info · " + m.actionHint() + " · q quit\n")
+		b.WriteString(linkHint + "\n")
+		if m.linkError != "" {
+			b.WriteString(m.linkError + "\n")
+		}
 	}
 	return b.String()
 }
@@ -2589,25 +2615,38 @@ func (m model) actionHint() string {
 }
 
 func (m model) renderFooter(width int) string {
-	keysText := "j/k move · i info · m select text · " + m.actionHint() + " · q quit"
+	keysText := "j/k move · i info · " + m.actionHint() + " · q quit"
 	if m.shuttingDown {
 		keysText = "shutting down · q again hides progress"
 	}
 	if m.selectingText {
-		keysText = "select text to copy · m resume · q quit"
+		keysText = textSelectionHint
 	}
+	if !m.shuttingDown && !m.selectingText {
+		keysText += "\n" + linkHint
+		if m.linkError != "" {
+			keysText += "\n" + truncateText(m.linkError, width)
+		}
+	}
+	// Wrap the hints before measuring so narrow terminals reserve enough rows.
+	keysText = ansi.Wrap(keysText, width, "")
 	keys := m.styles.muted.Render(keysText)
 	rightText := m.logDir
 	if m.shuttingDown {
 		rightText = "please wait"
 	}
-	rightText = truncateText(rightText, max(0, width-lipgloss.Width(keys)-1))
+	if lipgloss.Width(keys)+lipgloss.Width(rightText)+3 > width {
+		rightText = ""
+	}
 	right := m.styles.muted.Render(rightText)
 	gap := width - lipgloss.Width(keys) - lipgloss.Width(right)
 	if gap < 1 {
 		gap = 1
 	}
-	return keys + strings.Repeat(" ", gap) + right
+	if rightText == "" {
+		return keys
+	}
+	return lipgloss.JoinHorizontal(lipgloss.Top, keys, strings.Repeat(" ", gap)+right)
 }
 
 func (m model) selectedState() *serviceState {
@@ -2624,6 +2663,7 @@ func (m model) selectedState() *serviceState {
 }
 
 func (m *model) refreshSelectedLog() {
+	m.linkError = ""
 	if len(m.order) == 0 {
 		return
 	}

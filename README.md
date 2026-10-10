@@ -203,6 +203,8 @@ Compose-published ports remain under the Compose file's control. Stack does not 
 ## Keys
 
 - Click a service row to select its logs. The mouse wheel moves one service at a time.
+- Click a complete HTTP(S) URL in the logs to open it in your browser.
+- `o` — open the first complete HTTP(S) URL visible in the selected logs
 - `m` — switch between mouse navigation and terminal text selection
 - `j` / `k` — move selection
 - `g` / `G` — jump to first / last
@@ -213,6 +215,8 @@ Compose-published ports remain under the Compose file's control. Stack does not 
 To copy logs, press `m`, select text, and use your terminal's usual copy command.
 The display stays still while services continue to run.
 Press `m` again to show the latest output and restore mouse navigation.
+Text selection mode also restores your terminal's usual link-opening gesture.
+Stack does not open URLs cut off by the log panel. Widen the terminal to show the complete URL.
 
 ## Environment
 
